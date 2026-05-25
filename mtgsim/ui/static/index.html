@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>MTG Sim — Mono-Red vs Mono-White</title>
+<style>
+  * { box-sizing: border-box; }
+  body { background:#0c0c10; color:#e6e6e6; font-family:'JetBrains Mono', Menlo, monospace; margin:0; padding:0; font-size:12px; }
+  header { background:#1a1a22; padding:8px 14px; border-bottom:1px solid #2a2a36; display:flex; align-items:center; gap:12px; position:sticky; top:0; z-index:10; }
+  header h1 { font-size:14px; margin:0; color:#fafaf7; }
+  header .stats { color:#9aa; }
+  header .badge { background:#2a2a36; padding:3px 8px; border-radius:3px; }
+  header .badge.red { background:#5a1f1f; color:#ffaaaa; }
+  header .badge.white { background:#3a3a30; color:#eee; }
+  button { background:#2a2a36; color:#e6e6e6; border:1px solid #3a3a48; padding:5px 10px; cursor:pointer; font-family:inherit; font-size:12px; border-radius:3px; }
+  button:hover { background:#3a3a48; }
+  input[type=range] { width:120px; }
+  #grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap:8px; padding:8px; }
+  .match { background:#15151c; border:1px solid #2a2a36; border-radius:4px; padding:6px; display:flex; flex-direction:column; gap:4px; }
+  .match-head { display:flex; justify-content:space-between; align-items:center; font-size:11px; color:#aaa; }
+  .turn { color:#ffd; }
+  .players { display:flex; flex-direction:column; gap:4px; }
+  .player { background:#1a1a22; border-radius:3px; padding:5px; }
+  .player.red { border-left:3px solid #aa3333; }
+  .player.white { border-left:3px solid #d6d6d6; }
+  .player.active { background:#22222e; }
+  .pheader { display:flex; justify-content:space-between; font-weight:bold; }
+  .pname { color:#eee; }
+  .plife { color:#ffd; font-size:14px; }
+  .plife.low { color:#ff8888; }
+  .pmeta { color:#778; font-size:10px; margin-top:2px; }
+  .bf { display:flex; flex-wrap:wrap; gap:3px; margin-top:4px; min-height:18px; }
+  .card-pip { display:inline-block; padding:1px 5px; border-radius:2px; font-size:10px; background:#2a2a36; border:1px solid #3a3a48; }
+  .card-pip.creature { background:#3a2a2a; }
+  .card-pip.creature.attacking { background:#aa3333; color:#fff; }
+  .card-pip.land { background:#2a3a2a; color:#9c9; }
+  .card-pip.tap { opacity:0.5; }
+  .card-pip.token { font-style:italic; }
+  .log { background:#0a0a0e; padding:5px; border-radius:3px; font-size:10px; max-height:120px; overflow-y:auto; color:#778; font-family:inherit; }
+  .log .line { padding:1px 0; }
+  .log .line.cast { color:#ff9; }
+  .log .line.combat { color:#f99; }
+  .log .line.end { color:#9f9; }
+  .controls { display:flex; gap:6px; align-items:center; }
+  .ctrl-label { color:#9aa; }
+  #agg-bar { font-weight:bold; }
+  .flag-btn { background:#2a2a36; border:1px solid #3a3a48; color:#ccc; font-size:10px; padding:2px 6px; cursor:pointer; border-radius:3px; margin-left:6px; }
+  .flag-btn:hover { background:#3a3a48; }
+  .flag-btn.flag-on { background:#aa3333; color:#fff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MTG Standard Sim — Mono-Red vs Mono-White</h1>
+  <div class="controls">
+    <button id="btn-pause">⏸ Pause</button>
+    <button id="btn-resume">▶ Resume</button>
+    <button id="btn-step">⏭ Step</button>
+    <span class="ctrl-label">Speed:</span>
+    <input id="speed" type="range" min="0" max="1000" value="100" />
+    <span id="speed-val">100ms</span>
+  </div>
+  <div class="stats" id="agg-bar">…</div>
+  <a href="/replay" target="_blank" style="color:#9cf;margin-left:auto;text-decoration:none;">📼 Replays →</a>
+</header>
+<div id="grid"></div>
+
+<script>
+const grid = document.getElementById('grid');
+const btnPause = document.getElementById('btn-pause');
+const btnResume = document.getElementById('btn-resume');
+const btnStep = document.getElementById('btn-step');
+const speedSlider = document.getElementById('speed');
+const speedVal = document.getElementById('speed-val');
+const aggBar = document.getElementById('agg-bar');
+
+const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const ws = new WebSocket(proto + '//' + location.host + '/ws');
+
+ws.onmessage = (e) => {
+  const snap = JSON.parse(e.data);
+  render(snap);
+};
+
+btnPause.onclick = () => ws.send(JSON.stringify({cmd:'pause'}));
+btnResume.onclick = () => ws.send(JSON.stringify({cmd:'resume'}));
+btnStep.onclick = () => ws.send(JSON.stringify({cmd:'step', n:1}));
+speedSlider.oninput = () => {
+  const v = parseInt(speedSlider.value);
+  speedVal.textContent = v + 'ms';
+  ws.send(JSON.stringify({cmd:'speed', ms:v}));
+};
+
+async function flagSlot(slot) {
+  try {
+    await fetch('/api/flag/' + slot, {method:'POST'});
+  } catch (e) { console.error(e); }
+}
+window.flagSlot = flagSlot;
+
+function deckClass(name) {
+  if (!name) return '';
+  if (name.toLowerCase().includes('red')) return 'red';
+  if (name.toLowerCase().includes('white')) return 'white';
+  return '';
+}
+
+function renderCard(c) {
+  const cls = c.is_land ? 'land' : (c.is_creature ? 'creature' : '');
+  const tap = c.tap ? 'tap' : '';
+  const atk = c.attacking ? 'attacking' : '';
+  const tok = c.is_token ? 'token' : '';
+  let label = c.name;
+  if (c.is_creature && c.p != null) {
+    const pBuff = (c.counters['+1/+1']||0) + (c.counters['+2/+1_eot_p']||0);
+    const tBuff = (c.counters['+1/+1']||0) + (c.counters['+2/+1_eot_t']||0);
+    label += ` ${c.p + pBuff}/${c.t + tBuff}`;
+  }
+  if (c.counters['loyalty']) label += ` [${c.counters['loyalty']}]`;
+  return `<span class="card-pip ${cls} ${tap} ${atk} ${tok}" title="${c.name}">${label}</span>`;
+}
+
+function renderPlayer(p, isActive) {
+  const cls = deckClass(p.name);
+  const lifeLow = p.life <= 5 ? 'low' : '';
+  const lands = p.battlefield.filter(c=>c.is_land);
+  const creatures = p.battlefield.filter(c=>c.is_creature);
+  const others = p.battlefield.filter(c=>!c.is_land && !c.is_creature);
+  return `
+    <div class="player ${cls} ${isActive?'active':''}">
+      <div class="pheader">
+        <span class="pname">${p.name}${p.lost?' (LOST)':''}${p.city_blessing?' ★':''}</span>
+        <span class="plife ${lifeLow}">♥ ${p.life}</span>
+      </div>
+      <div class="pmeta">
+        Hand: ${p.hand_count} | Lib: ${p.library_count} | Grave: ${p.graveyard_count}
+        | Lands: ${lands.length} | Mulls: ${p.mulligans}
+      </div>
+      <div class="bf">
+        ${creatures.map(renderCard).join('')}
+        ${others.map(renderCard).join('')}
+      </div>
+      <div class="bf" style="opacity:0.7">
+        ${lands.map(renderCard).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function render(snap) {
+  // aggregate
+  const agg = snap.aggregate;
+  const rec = snap.record_stats || {};
+  const recHtml = snap.record_to
+    ? ` <span class="badge" title="${snap.record_to} (${snap.record_mode})">REC ${rec.matches_written||0}m ${rec.decisions||0}d ${((rec.bytes||0)/1024).toFixed(0)}KB</span>`
+    : '';
+  aggBar.innerHTML = `Matches done: <span class="badge">${agg.matches_done}</span>
+    <span class="badge red">Mono-Red: ${agg.wins['Mono-Red']||0}</span>
+    <span class="badge white">Mono-White: ${agg.wins['Mono-White']||0}</span>
+    Draws: ${agg.draws||0}${recHtml}`;
+  // matches grid
+  let html = '';
+  for (const m of snap.matches) {
+    const s = m.state || {};
+    const players = s.players || [];
+    const turn = s.turn || 0;
+    const step = s.step || '';
+    const winner = s.winner_idx != null ? `WINNER P${s.winner_idx}` : (s.draw ? 'DRAW' : '');
+    const flagLabel = m.flagged ? '⏺ flagged' : '⚐ Flag';
+    const flagCls = m.flagged ? 'flag-on' : '';
+    const lastReplay = m.last_replay ? `<a href="/replay?file=${encodeURIComponent(m.last_replay)}" target="_blank" style="color:#9cf;">${m.last_replay}</a>` : '';
+    html += `<div class="match">
+      <div class="match-head">
+        <span>Match #${m.id} <span class="turn">T${turn} ${step}</span></span>
+        <span>${winner} ${m.cumulative.last_winner ? '(last: '+m.cumulative.last_winner+')' : ''}
+          <button class="flag-btn ${flagCls}" onclick="flagSlot(${m.id})">${flagLabel}</button>
+        </span>
+      </div>
+      ${lastReplay ? `<div style="font-size:10px;color:#9aa">last replay: ${lastReplay}</div>` : ''}
+      <div class="players">
+        ${players.map((p,i)=>renderPlayer(p, s.active_idx === i)).join('')}
+      </div>
+      <div class="log">
+        ${m.log.map(l=>{
+          let cls='';
+          if (l.includes('casts')||l.includes('cast')) cls='cast';
+          else if (l.includes('damage')||l.includes('attacks')) cls='combat';
+          else if (l.includes('GAME END')) cls='end';
+          return `<div class="line ${cls}">${l.replace(/</g,'&lt;')}</div>`;
+        }).join('')}
+      </div>
+    </div>`;
+  }
+  grid.innerHTML = html;
+}
+</script>
+</body>
+</html>

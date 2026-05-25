@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>MTG Replay Viewer</title>
+<style>
+  * { box-sizing: border-box; }
+  body { background:#0c0c10; color:#e6e6e6; font-family:'JetBrains Mono', Menlo, monospace; margin:0; padding:0; font-size:12px; }
+  header { background:#1a1a22; padding:10px 14px; border-bottom:1px solid #2a2a36; display:flex; gap:12px; align-items:center; }
+  header h1 { font-size:14px; margin:0; color:#fafaf7; }
+  select, button, input { background:#2a2a36; color:#e6e6e6; border:1px solid #3a3a48; padding:5px 10px; font-family:inherit; font-size:12px; border-radius:3px; }
+  button:hover, select:hover { background:#3a3a48; cursor:pointer; }
+  #main { display:grid; grid-template-columns: 1fr 380px; gap:8px; padding:8px; min-height:calc(100vh - 50px); }
+  #board { background:#15151c; border:1px solid #2a2a36; border-radius:4px; padding:10px; }
+  #side { background:#15151c; border:1px solid #2a2a36; border-radius:4px; padding:10px; display:flex; flex-direction:column; gap:8px; }
+  .player { background:#1a1a22; border-radius:3px; padding:8px; margin-bottom:6px; }
+  .player.red { border-left:3px solid #aa3333; }
+  .player.white { border-left:3px solid #d6d6d6; }
+  .player.active { background:#22222e; }
+  .pheader { display:flex; justify-content:space-between; font-weight:bold; font-size:13px; }
+  .plife { font-size:16px; color:#ffd; }
+  .plife.low { color:#ff8888; }
+  .pmeta { color:#778; font-size:10px; margin:3px 0; }
+  .zone-label { color:#9aa; font-size:10px; margin-top:6px; text-transform:uppercase; }
+  .bf { display:flex; flex-wrap:wrap; gap:4px; min-height:20px; }
+  .card-pip { display:inline-block; padding:2px 6px; border-radius:2px; font-size:11px; background:#2a2a36; border:1px solid #3a3a48; }
+  .card-pip.creature { background:#3a2a2a; }
+  .card-pip.creature.attacking { background:#aa3333; color:#fff; }
+  .card-pip.land { background:#2a3a2a; color:#9c9; }
+  .card-pip.tap { opacity:0.5; }
+  .card-pip.token { font-style:italic; }
+  .card-pip.hand { background:#2a3a4a; }
+  .timeline-wrap { padding:8px; background:#1a1a22; border-top:1px solid #2a2a36; position:sticky; top:0; z-index:5; }
+  #timeline { width:100%; }
+  .events-list { max-height:60vh; overflow-y:auto; font-size:10px; line-height:1.4; }
+  .events-list .ev { padding:2px 4px; cursor:pointer; border-radius:2px; }
+  .events-list .ev:hover { background:#22222e; }
+  .events-list .ev.active { background:#3a3a48; color:#ffd; font-weight:bold; }
+  .events-list .ev.kind-cast { color:#ff9; }
+  .events-list .ev.kind-damage { color:#f99; }
+  .events-list .ev.kind-game_start, .events-list .ev.kind-game_end { color:#9f9; }
+  .events-list .ev.kind-decision { color:#9cf; font-style:italic; }
+  .dec-info { background:#0a0a14; padding:6px; border-radius:3px; font-size:11px; color:#9cf; margin-top:6px; }
+  .dec-info table { border-collapse:collapse; font-size:10px; }
+  .dec-info td { padding:1px 4px; border-bottom:1px solid #2a2a36; }
+  .dec-info .chosen { color:#ffd; font-weight:bold; }
+  .controls { display:flex; gap:6px; align-items:center; }
+  .nav-btn { padding:3px 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📼 Replay Viewer</h1>
+  <select id="replay-select"><option value="">— pick a replay —</option></select>
+  <button id="refresh-list">↻</button>
+  <span id="info" style="color:#9aa"></span>
+</header>
+<div id="main">
+  <div id="board">
+    <div class="timeline-wrap">
+      <div class="controls">
+        <button class="nav-btn" onclick="step(-10)">⏪ -10</button>
+        <button class="nav-btn" onclick="step(-1)">◀</button>
+        <button class="nav-btn" onclick="togglePlay()" id="play-btn">▶</button>
+        <button class="nav-btn" onclick="step(1)">▶</button>
+        <button class="nav-btn" onclick="step(10)">⏩ +10</button>
+        <span style="margin-left:auto" id="event-counter">— / —</span>
+      </div>
+      <input type="range" id="timeline" min="0" max="0" value="0" step="1" />
+    </div>
+    <div id="state-view"><em>Select a replay file…</em></div>
+  </div>
+  <div id="side">
+    <div>
+      <div class="zone-label">Header</div>
+      <div id="header-info"></div>
+    </div>
+    <div>
+      <div class="zone-label">Current event</div>
+      <div id="current-event"></div>
+    </div>
+    <div>
+      <div class="zone-label">Events</div>
+      <div id="events-list" class="events-list"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+let records = [];
+let cur = 0;
+let curState = null;
+let playing = false;
+let playTimer = null;
+
+const sel = document.getElementById('replay-select');
+const refreshBtn = document.getElementById('refresh-list');
+const timeline = document.getElementById('timeline');
+const counter = document.getElementById('event-counter');
+const stateView = document.getElementById('state-view');
+const evList = document.getElementById('events-list');
+const headerInfo = document.getElementById('header-info');
+const curEvDiv = document.getElementById('current-event');
+const playBtn = document.getElementById('play-btn');
+const infoSpan = document.getElementById('info');
+
+// auto-load from ?file=
+const params = new URLSearchParams(location.search);
+const autoFile = params.get('file');
+
+async function refreshList() {
+  const r = await fetch('/api/replays');
+  const files = await r.json();
+  sel.innerHTML = '<option value="">— pick a replay —</option>' +
+    files.map(f => `<option value="${f.name}">${f.name} (${(f.size/1024).toFixed(1)}KB)</option>`).join('');
+  if (autoFile) {
+    sel.value = autoFile;
+    if (sel.value) loadReplay(autoFile);
+  }
+}
+
+async function loadReplay(name) {
+  if (!name) return;
+  infoSpan.textContent = 'loading…';
+  const r = await fetch('/api/replay/' + encodeURIComponent(name));
+  const j = await r.json();
+  records = j.lines.map(l => { try { return JSON.parse(l); } catch { return null; }}).filter(Boolean);
+  cur = 0;
+  curState = null;
+  timeline.max = Math.max(0, records.length - 1);
+  timeline.value = 0;
+  infoSpan.textContent = `${records.length} records`;
+  renderHeaderInfo();
+  renderEventsList();
+  render();
+}
+
+sel.onchange = () => loadReplay(sel.value);
+refreshBtn.onclick = refreshList;
+timeline.oninput = () => { cur = parseInt(timeline.value); render(); };
+
+function step(n) {
+  cur = Math.max(0, Math.min(records.length - 1, cur + n));
+  timeline.value = cur;
+  render();
+}
+
+function togglePlay() {
+  playing = !playing;
+  playBtn.textContent = playing ? '⏸' : '▶';
+  if (playing) {
+    playTimer = setInterval(() => {
+      if (cur >= records.length - 1) { togglePlay(); return; }
+      step(1);
+    }, 250);
+  } else if (playTimer) {
+    clearInterval(playTimer); playTimer = null;
+  }
+}
+
+function renderHeaderInfo() {
+  const h = records.find(r => r.type === 'header');
+  const f = records.find(r => r.type === 'footer');
+  if (h) {
+    headerInfo.innerHTML = `Slot ${h.slot} Match ${h.match_id}<br>${h.deck0} vs ${h.deck1}<br>seed=${h.seed}`;
+  } else { headerInfo.innerHTML = ''; }
+  if (f) {
+    headerInfo.innerHTML += `<br><b>Final:</b> ${f.winner || 'draw'} (${f.wins0}-${f.wins1})`;
+  }
+}
+
+function renderEventsList() {
+  evList.innerHTML = records.map((r, i) => {
+    let label = '';
+    let cls = '';
+    if (r.type === 'event') {
+      label = `T${r.turn} ${r.step}: ${r.kind}`;
+      cls = 'kind-' + r.kind;
+    } else if (r.type === 'decision') {
+      label = `decision (P${r.root_idx}) → ${r.chosen} of ${r.legal.length}`;
+      cls = 'kind-decision';
+    } else if (r.type === 'header') {
+      label = '── header ──';
+    } else if (r.type === 'footer') {
+      label = '── footer ──';
+    }
+    return `<div class="ev ${cls}" onclick="cur=${i};timeline.value=${i};render()" data-i="${i}">${i.toString().padStart(3,'0')}: ${label}</div>`;
+  }).join('');
+}
+
+function deckClass(name) {
+  if (!name) return '';
+  if (name.toLowerCase().includes('red')) return 'red';
+  if (name.toLowerCase().includes('white')) return 'white';
+  return '';
+}
+
+function renderCard(c, opts={}) {
+  const cls = c.is_land ? 'land' : (c.is_creature ? 'creature' : '');
+  const tap = c.tap ? 'tap' : '';
+  const atk = c.attacking ? 'attacking' : '';
+  const tok = c.is_token ? 'token' : '';
+  const hand = opts.hand ? 'hand' : '';
+  let label = c.name;
+  if (c.is_creature && c.p != null) {
+    const pBuff = (c.counters['+1/+1']||0) + (c.counters['+2/+1_eot_p']||0);
+    const tBuff = (c.counters['+1/+1']||0) + (c.counters['+2/+1_eot_t']||0);
+    label += ` ${c.p + pBuff}/${c.t + tBuff}`;
+  }
+  if (c.counters && c.counters.loyalty) label += ` [${c.counters.loyalty}]`;
+  return `<span class="card-pip ${cls} ${tap} ${atk} ${tok} ${hand}" title="${c.name}">${label}</span>`;
+}
+
+function renderPlayer(p, isActive) {
+  const cls = deckClass(p.name);
+  const lifeLow = p.life <= 5 ? 'low' : '';
+  const lands = p.battlefield.filter(c=>c.is_land);
+  const creatures = p.battlefield.filter(c=>c.is_creature);
+  const others = p.battlefield.filter(c=>!c.is_land && !c.is_creature);
+  const hand = p.hand || [];
+  return `
+    <div class="player ${cls} ${isActive?'active':''}">
+      <div class="pheader">
+        <span>${p.name}${p.lost?' (LOST)':''}${p.city_blessing?' ★':''}</span>
+        <span class="plife ${lifeLow}">♥ ${p.life}</span>
+      </div>
+      <div class="pmeta">Hand ${p.hand_count||hand.length} | Lib ${p.library_count} | Grave ${p.graveyard?p.graveyard.length:'?'} | Mulls ${p.mulligans}</div>
+      <div class="zone-label">Hand</div>
+      <div class="bf">${hand.map(c=>renderCard(c,{hand:true})).join('')}</div>
+      <div class="zone-label">Battlefield — creatures + other</div>
+      <div class="bf">${creatures.map(c=>renderCard(c)).join('')} ${others.map(c=>renderCard(c)).join('')}</div>
+      <div class="zone-label">Lands</div>
+      <div class="bf">${lands.map(c=>renderCard(c)).join('')}</div>
+    </div>
+  `;
+}
+
+function render() {
+  counter.textContent = `${cur+1} / ${records.length}`;
+  // find current state: walk back to last event/header that had state
+  let st = null;
+  for (let i = cur; i >= 0; i--) {
+    const r = records[i];
+    if (r.type === 'event' && r.state) { st = r.state; break; }
+  }
+  curState = st;
+  // highlight in events list
+  evList.querySelectorAll('.ev').forEach(el => el.classList.toggle('active', parseInt(el.dataset.i) === cur));
+  // current event details
+  const ev = records[cur];
+  if (ev) {
+    if (ev.type === 'event') {
+      curEvDiv.innerHTML = `<b>${ev.kind}</b> T${ev.turn} ${ev.step}<br>` +
+        Object.entries(ev.data||{}).map(([k,v])=>`${k}: ${JSON.stringify(v)}`).join('<br>');
+    } else if (ev.type === 'decision') {
+      const rows = ev.legal.map((a,i) => {
+        const v = ev.visits[i]||0;
+        const cls = i===ev.chosen?'chosen':'';
+        return `<tr class="${cls}"><td>${i===ev.chosen?'▶':' '}</td><td>${v}</td><td>${a.kind}</td><td>${a.card_cid||''}</td><td>${(a.target_cids||[]).join(',')||''}</td></tr>`;
+      }).join('');
+      curEvDiv.innerHTML = `<div class="dec-info">MCTS decision (P${ev.root_idx}), value=${ev.value.toFixed(3)}<table>
+        <tr><th></th><th>visits</th><th>kind</th><th>card</th><th>tgt</th></tr>${rows}</table></div>`;
+    } else {
+      curEvDiv.innerHTML = `<b>${ev.type}</b> ${JSON.stringify(ev).slice(0,200)}`;
+    }
+  }
+  // board
+  if (st && st.players) {
+    stateView.innerHTML = `<div style="color:#aaa;font-size:11px;margin-bottom:6px;">Turn ${st.turn} | ${st.step} | active P${st.active_idx} | stack=${st.stack_size}</div>` +
+      st.players.map((p,i)=>renderPlayer(p, st.active_idx === i)).join('');
+  } else {
+    stateView.innerHTML = '<em>(no state at this event)</em>';
+  }
+}
+
+refreshList();
+</script>
+</body>
+</html>
