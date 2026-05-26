@@ -46,6 +46,8 @@ class GameState:
     game_id: int = 0
     # data recorder (optional)
     recorder: Optional[Any] = None
+    # ai_step callback (set by match runner) — enables priority windows in resolve_all
+    ai_step: Optional[Callable] = None
 
     def log(self, msg: str):
         if self.log_enabled:
@@ -260,6 +262,39 @@ class GameState:
         self.check_state_based()
 
     def resolve_all(self):
+        """Process stack with APNAP priority windows per rule 116.4 / 117 / 608.
+        If ai_step is set, each spell/ability on stack triggers a priority round
+        where both players can respond. Only when both pass is the top resolved."""
+        ai_step = self.ai_step
+        if ai_step is None:
+            while self.stack and not self.is_over():
+                self.resolve_top()
+                self.check_state_based()
+            return
+        # Priority-aware resolution
         while self.stack and not self.is_over():
-            self.resolve_top()
+            # SBA loop until stable
             self.check_state_based()
+            # Priority round: APNAP order, all pass → resolve top
+            passes = 0
+            order = [self.active_idx, 1 - self.active_idx]
+            i = 0
+            iter_limit = 16  # safety cap against infinite loops
+            while passes < 2 and iter_limit > 0:
+                if self.is_over():
+                    return
+                pidx = order[i]
+                try:
+                    act = ai_step(self, "stack_response", player_idx=pidx)
+                except Exception:
+                    act = None
+                if act:
+                    passes = 0
+                    i = 0
+                else:
+                    passes += 1
+                    i = (i + 1) % 2
+                iter_limit -= 1
+            if self.stack:
+                self.resolve_top()
+                self.check_state_based()

@@ -29,12 +29,31 @@ class HeuristicAI:
         if kind == "priority":
             idx = kwargs.get("player_idx", game.active_idx)
             return self._priority(game, idx)
+        if kind == "stack_response":
+            idx = kwargs.get("player_idx", game.active_idx)
+            return self._stack_response(game, idx)
         if kind == "declare_attackers":
             return self._declare_attackers(game)
         if kind == "declare_blockers":
             return self._declare_blockers(game)
         if kind == "mulligan":
             return self._mulligan(game, kwargs["player_idx"])
+        return None
+
+    def _stack_response(self, game, idx):
+        """Called during stack resolution priority windows (rule 116.4 / 608).
+        Each player gets opportunity to cast instant or activate ability in response
+        to the top of the stack before it resolves.
+
+        Heuristic strategy:
+          - If a CREATURE SPELL is on stack belonging to opponent and we have a Wizard's
+            Lightning that can kill it post-resolution, defer (can only target permanents).
+          - If a TRIGGERED ABILITY (e.g., saga chapter creating tokens) belongs to opp and
+            we can kill its source NOW (creature), do it.
+          - For these decks: mostly pass (no counterspells, limited targets on stack).
+        """
+        # for now pass — these decks have very narrow response windows
+        # (no creatures-targeting instants that interact with spells on stack)
         return None
 
     # ---------------- Mulligan ----------------

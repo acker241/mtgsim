@@ -154,6 +154,8 @@ def play_game(deck0: DeckSpec, deck1: DeckSpec, rng: random.Random,
         idx = kwargs.get("player_idx", g.active_idx)
         ai = ai0 if idx == 0 else ai1
         return ai(g, kind, **kwargs)
+    # expose ai_step on game so resolve_all can offer priority windows
+    game.ai_step = step_fn
 
     while not game.is_over():
         observer.wait_if_paused()
