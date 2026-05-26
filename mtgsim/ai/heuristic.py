@@ -998,38 +998,76 @@ class HeuristicAI:
         idx = game.active_idx
         pl = game.players[idx]
         opp = self._opp(game, idx)
+
+        # race pressure: total power on my side that could threaten lethal soon
+        my_power_total = sum(c.power(game) for c in pl.battlefield
+                             if c.cdef.is_creature() and c.can_attack(game))
+        opp_power_total = sum(c.power(game) for c in opp.battlefield
+                              if c.cdef.is_creature() and not c.tapped)
+        # racing if we'd kill opp faster than they kill us
+        my_turns_to_lethal = (opp.life // max(1, my_power_total)) if my_power_total else 99
+        opp_turns_to_lethal = (pl.life // max(1, opp_power_total)) if opp_power_total else 99
+        racing = my_turns_to_lethal <= opp_turns_to_lethal
+        # forced attack: very low life, must close out
+        forced = opp.life <= 6 or pl.life <= 6
+
         atks: List[Card] = []
         for c in pl.battlefield:
             if not c.can_attack(game):
                 continue
-            # decide: attack if no obvious bad trade or if going for damage
             p = c.power(game)
-            t = c.toughness(game)
-            # opponent blockers analysis
-            blockers = [b for b in opp.battlefield if b.cdef.is_creature() and b.can_block(c, game)]
+            if p <= 0:
+                continue
+            # blockers opp could use
+            blockers = [b for b in opp.battlefield
+                        if b.cdef.is_creature() and b.can_block(c, game)]
             if not blockers:
-                if p > 0:
-                    atks.append(c)
+                # unblockable — always attack
+                atks.append(c)
                 continue
-            # any blocker that survives + kills me without me killing it = bad trade
-            worst = min((b.toughness(game) - b.damage_marked - p, b.power(game) - t) for b in blockers) if blockers else (0, 0)
-            # if best opp blocker has power >= my toughness and my power < their toughness, bad trade
-            bad = False
-            for b in blockers:
-                if b.power(game) >= t and p < (b.toughness(game) - b.damage_marked) and Keyword.LIFELINK not in c.keywords(game):
-                    bad = True
-                    break
-            # aggro: attack even if bad trade (clock matters more than board)
-            if bad and not self.is_aggro and opp.life > 6 and pl.life > 8:
-                continue
-            # aggro: skip only if creature dies AND deals 0 damage (e.g., flying blocker shuts down ground)
-            if self.is_aggro and bad:
-                # check if attacker would deal damage despite trade
-                blocker_min_tough = min((b.toughness(game) - b.damage_marked) for b in blockers)
-                if p < blocker_min_tough:
-                    # would deal 0 damage — skip
+            # simulate opp's best block from opp's perspective
+            # opp will pick block set with highest _block_score (positive = good for opp)
+            best_opp_score = None
+            best_block_set = None
+            # candidate sets: each single legal blocker + each pair
+            cand_sets = [[b] for b in blockers]
+            if len(blockers) >= 2:
+                for i in range(len(blockers)):
+                    for j in range(i+1, len(blockers)):
+                        cand_sets.append([blockers[i], blockers[j]])
+            for cs in cand_sets:
+                s = self._block_score(c, cs, game, lethal_pressure=False)
+                if s is None:
                     continue
-            atks.append(c)
+                if best_opp_score is None or s > best_opp_score:
+                    best_opp_score = s
+                    best_block_set = cs
+            # if opp's best block is profitable for opp, attacker likely dies/trades for opp gain
+            if best_opp_score is not None and best_opp_score > 0:
+                # check if attacker still deals face damage (e.g., blocker too small)
+                atk_dies, dying = self._simulate_block(c, best_block_set, game)
+                # if blocker absorbs all damage and attacker dies, this attack only loses our creature
+                if atk_dies and not forced and not racing:
+                    continue
+                # if attacker survives but takes damage that prevents it being useful next turn,
+                # OK to attack only if racing or forced
+                if atk_dies and (racing or forced):
+                    # only ok if attacker is "expendable" (small) or we're closing out
+                    # use a simple rule: attack if our power total kills opp within next turn
+                    if my_turns_to_lethal <= 1:
+                        atks.append(c)
+                    elif p >= 2 and not forced:
+                        # don't suicide medium creatures
+                        continue
+                    else:
+                        atks.append(c)
+                    continue
+                # if attacker survives the block, attack (creature absorbs damage but lives)
+                if not atk_dies:
+                    atks.append(c)
+            else:
+                # opp won't profitably block; attacker likely deals face damage
+                atks.append(c)
         return atks
 
     # ---------------- Combat: blockers ----------------
