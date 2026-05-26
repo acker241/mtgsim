@@ -267,6 +267,7 @@ def _adanto_def():
     cdef = CardDef(
         name="Adanto, the First Fort",
         types=CardType.LAND,
+        legendary=True,
         subtypes={Subtype.PLAINS},
         text="T: add W. 1W, T: create 1/1 Vampire token with lifelink.",
     )
@@ -307,6 +308,7 @@ def legions_landing():
     cdef = CardDef(
         name="Legion's Landing",
         types=CardType.ENCHANTMENT,
+        legendary=True,
         cost=ManaCost.parse("W"),
         colors=Color.W,
         text="Legendary. ETB: 1/1 W Vampire lifelink. Attack with 3+: transform.",
@@ -536,6 +538,7 @@ def ajani_adversary_of_tyrants():
     cdef = CardDef(
         name="Ajani, Adversary of Tyrants",
         types=CardType.PLANESWALKER,
+        legendary=True,
         subtypes={Subtype.AJANI},
         cost=ManaCost.parse("2WW"),
         colors=Color.W,

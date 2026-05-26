@@ -114,10 +114,21 @@ class GameState:
             if c.cdef.is_planeswalker():
                 if c.counters.get("loyalty", 0) <= 0:
                     dying.append(c)
+        # legend rule (704.5k): if a player controls 2+ legendary permanents with same name,
+        # they choose one and the rest go to their owners' graveyards.
+        for p in self.players:
+            by_name: dict = {}
+            for c in p.battlefield:
+                if c.cdef.legendary:
+                    by_name.setdefault(c.name, []).append(c)
+            for name, lst in by_name.items():
+                if len(lst) > 1:
+                    # keep first (arbitrary AI choice); rest die
+                    for c in lst[1:]:
+                        if c not in dying:
+                            dying.append(c)
         for c in dying:
             self._move_to_graveyard(c, reason="dies")
-        # legend rule (simplified): if 2+ legendaries same name same controller, keep one
-        # (none of these decks need it strictly; skip for now)
         # ascend check
         for p in self.players:
             p.check_ascend()

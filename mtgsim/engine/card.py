@@ -17,6 +17,7 @@ class CardDef:
     name: str
     types: CardType
     subtypes: Set[Subtype] = field(default_factory=set)
+    legendary: bool = False  # for rule 704.5k (legend rule)
 
     def __deepcopy__(self, memo):
         # treat as singleton — never duplicated
