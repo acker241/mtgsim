@@ -359,8 +359,30 @@ class HeuristicAI:
         cands = [c for c in opp.battlefield if not c.cdef.is_land()]
         if not cands:
             return None
-        cands.sort(key=lambda c: -((c.power(game) if c.cdef.is_creature() else 0)
-                                    + (c.cdef.cost.cmc() if c.cdef.cost else 0)))
+
+        def priority(c: Card) -> float:
+            # high priority: card-advantage permanents that snowball if not answered
+            if c.name == "Experimental Frenzy":
+                return 1000
+            if c.cdef.is_planeswalker():
+                return 800 + c.counters.get("loyalty", 0)
+            # creature priority: power + cmc + key-card bonuses
+            score = (c.power(game) if c.cdef.is_creature() else 0) * 3
+            score += c.cdef.cost.cmc() if c.cdef.cost else 0
+            if c.name == "Goblin Chainwhirler":
+                score += 30  # board wipes our 1-tough creatures
+            if c.name == "Runaway Steam-Kin":
+                # remove only if has counters (snowballing)
+                score += 10 + c.counters.get("+1/+1", 0) * 5
+            if c.name == "Rekindling Phoenix":
+                score += 25  # comes back from grave
+            if c.name == "Viashino Pyromancer":
+                score += 5
+            if Keyword.LIFELINK in c.keywords(game):
+                score += 8
+            return score
+
+        cands.sort(key=priority, reverse=True)
         return cands[0]
 
     def _pick_target_for(self, game: GameState, idx: int, card: Card, dmg_estimate: int = 0) -> Optional[Any]:
@@ -1164,9 +1186,29 @@ class HeuristicAI:
                 blockers_lost += b.power(game) + b.toughness(game)
         # face damage absorbed (if attacker doesn't die, it deals damage anyway,
         # but at least blockers absorbed some)
-        # we credit absorbed = attacker.power if attacker has no trample
         absorbed = atk.power(game) if blockers else 0
+
+        # HIDDEN BURN PENALTY: opp may finish off surviving blockers with burn next turn
+        # estimate burn potential = ~2 damage per card in opp hand (Lightning Strike/Shock/Skewer/WL avg)
+        # only apply if opp deck is aggro with burn (red)
+        opp_idx = atk.controller_idx
+        opp = game.players[opp_idx]
+        burn_threat = 0.0
+        # only red has burn; rough check: opp has any Mountain
+        from ..engine.enums import Subtype
+        has_red = any(Subtype.MOUNTAIN in c.cdef.subtypes for c in opp.battlefield if c.cdef.is_land())
+        if has_red and not atk_dies:
+            # surviving blockers might still be in burn range
+            for b in blockers:
+                if b.cid in dying:
+                    continue
+                tough_after = b.toughness(game) - b.damage_marked
+                # if blocker tough <= 3 (in burn range of Shock/LS/WL), discount its value
+                if tough_after <= 3:
+                    burn_threat += b.power(game) + b.toughness(game)
+        # discount survival value by hidden-burn risk fraction
         net = (atk_val if atk_dies else 0) - blockers_lost + (absorbed if lethal_pressure else 0)
+        net -= burn_threat * 0.4  # 40% expected loss from hidden burn
         return net
 
     def _declare_blockers(self, game: GameState) -> Dict[int, List[int]]:
