@@ -148,6 +148,12 @@ class HeuristicAI:
         if act:
             return act
 
+        # 1.6) clear-path burn: kill small blocker to let attackers through (aggro priority)
+        if self.is_aggro:
+            act = self._try_clear_blocker(game, idx)
+            if act:
+                return act
+
         # 1.7) main-phase removal burn: kill a key threat to clear board
         act = self._try_kill_threat_main(game, idx)
         if act:
@@ -502,9 +508,17 @@ class HeuristicAI:
         if pl.lost or game.is_over():
             return None
         is_my_turn = (idx == game.active_idx)
+
+        # combat tricks: between first-strike and normal damage, kill opposing creature to save our combatant
+        if game.step == Step.FIRST_STRIKE_DAMAGE:
+            act = self._try_save_combatant(game, idx)
+            if act:
+                return act
+
         burn_windows_nap = (
             Step.UPKEEP, Step.PRECOMBAT_MAIN, Step.BEGIN_COMBAT,
             Step.DECLARE_ATTACKERS, Step.DECLARE_BLOCKERS,
+            Step.FIRST_STRIKE_DAMAGE,
             Step.POSTCOMBAT_MAIN, Step.END_STEP,
         )
 
@@ -720,6 +734,135 @@ class HeuristicAI:
             game.observer.emit("lethal_burn", game, {"card": c.name})
             game.resolve_all()
             return {"action": "lethal_burn", "card": c.name}
+        return None
+
+    def _try_save_combatant(self, game: GameState, idx: int) -> Optional[dict]:
+        """In FIRST_STRIKE_DAMAGE step: if own creature in combat would die next step,
+        cast burn to finish opposing creature first (uses opposing.damage_marked from FS)."""
+        pl = game.players[idx]
+        # find own creatures in combat
+        my_in_combat = [c for c in pl.battlefield
+                        if c.cdef.is_creature() and (c.attacking or c.blocking)]
+        if not my_in_combat:
+            return None
+        by_cid = {c.cid: c for c in game.battlefield()}
+        pool = self._available_mana(game, idx)
+        for mine in my_in_combat:
+            # find opposing creature(s) this is in combat with
+            opposing = []
+            if mine.attacking:
+                opposing = [by_cid[bc] for bc in mine.blocked_by if bc in by_cid]
+            elif mine.blocking:
+                opposing = [by_cid[ac] for ac in mine.blocking if ac in by_cid]
+            if not opposing:
+                continue
+            # would my creature die in normal damage step?
+            incoming = sum(o.power(game) for o in opposing
+                           if not o.has_kw(Keyword.FIRST_STRIKE, game)
+                           and not o.has_kw(Keyword.DOUBLE_STRIKE, game))
+            my_tough_left = mine.toughness(game) - mine.damage_marked
+            if incoming < my_tough_left:
+                continue  # already survives
+            # try to burn an opposing creature to remove its damage output
+            for opp_c in opposing:
+                if Keyword.INDESTRUCTIBLE in opp_c.keywords(game):
+                    continue
+                tough_left = opp_c.toughness(game) - opp_c.damage_marked
+                for c in pl.hand:
+                    if not c.cdef.is_instant():
+                        continue
+                    dmg = self._spell_damage_estimate(c, 0)
+                    if dmg < tough_left:
+                        continue
+                    cost_eff = c.cdef.cost
+                    use_alt = False
+                    if c.name == "Wizard's Lightning" and self._has_wizard(game, idx):
+                        cost_eff = c.cdef.spectacle_cost
+                        use_alt = True
+                    if not self._can_pay(pool, cost_eff):
+                        continue
+                    if c.cdef.target_filter and not c.cdef.target_filter(game, pl, opp_c):
+                        continue
+                    ok = eng_actions.cast_spell(game, idx, c, targets=[opp_c],
+                                                 use_spectacle=use_alt)
+                    if ok:
+                        game.observer.emit("save_combatant", game,
+                                           {"card": c.name, "saved": mine.name,
+                                            "killed": opp_c.name})
+                        game.resolve_all()
+                        return {"action": "save_combatant"}
+        return None
+
+    def _try_clear_blocker(self, game: GameState, idx: int) -> Optional[dict]:
+        """Aggro: burn small blocker to free attackers. Only fires when attackers <= blockers
+        AND burning the blocker enables >= burn_dmg in unblocked face damage."""
+        pl = game.players[idx]
+        opp = self._opp(game, idx)
+        if opp.lost:
+            return None
+        # only fires during PRECOMBAT_MAIN before combat
+        if game.step.name != "PRECOMBAT_MAIN":
+            return None
+        # count attackers I'll have (already on BF, can attack)
+        my_attackers = [c for c in pl.battlefield if c.can_attack(game)]
+        if not my_attackers:
+            return None
+        # count opp blockers (untapped creatures)
+        opp_blockers = [c for c in opp.battlefield if c.cdef.is_creature() and not c.tapped]
+        if not opp_blockers:
+            return None  # already free path
+        if len(my_attackers) > len(opp_blockers):
+            return None  # have surplus already, no need
+        # candidate blockers: small toughness, killable by burn in hand
+        pool = self._available_mana(game, idx)
+        # find burn cards we can cast NOW that kill cheapest blocker
+        best = None  # (priority_score, card, target, use_alt)
+        for blocker in sorted(opp_blockers, key=lambda b: b.toughness(game) - b.damage_marked):
+            tough_left = blocker.toughness(game) - blocker.damage_marked
+            if Keyword.INDESTRUCTIBLE in blocker.keywords(game):
+                continue
+            for c in pl.hand:
+                if not (c.cdef.is_instant() or c.cdef.is_sorcery()):
+                    continue
+                dmg = self._spell_damage_estimate(c, 0)
+                if dmg < tough_left:
+                    continue
+                cost_eff = c.cdef.cost
+                use_alt = False
+                if c.name == "Wizard's Lightning" and self._has_wizard(game, idx):
+                    cost_eff = c.cdef.spectacle_cost
+                    use_alt = True
+                elif (c.cdef.spectacle_cost and c.cdef.is_sorcery()
+                      and pl.opp_lost_life_this_turn):
+                    cost_eff = c.cdef.spectacle_cost
+                    use_alt = True
+                if not self._can_pay(pool, cost_eff):
+                    continue
+                if c.cdef.target_filter and not c.cdef.target_filter(game, pl, blocker):
+                    continue
+                # estimate value: face damage we'd gain = power of attacker that was being blocked
+                # heuristic: pick attacker with highest power that would have been blocked
+                attackers_sorted = sorted(my_attackers, key=lambda a: -a.power(game))
+                # attacker absorbed = min(blocker.power, attacker.power); face gained = attacker.power
+                # use top attacker's power as rough gain estimate
+                gain = attackers_sorted[0].power(game) if attackers_sorted else 0
+                if gain < dmg:
+                    # not worth: burning costs more damage than we gain
+                    continue
+                key = (-gain, cost_eff.cmc())
+                if best is None or key < best[0]:
+                    best = (key, c, blocker, use_alt)
+            if best:
+                break  # take first viable blocker (smallest toughness)
+        if best is None:
+            return None
+        _, card, target, use_alt = best
+        ok = eng_actions.cast_spell(game, idx, card, targets=[target], use_spectacle=use_alt)
+        if ok:
+            game.observer.emit("clear_blocker", game,
+                               {"card": card.name, "target": target.name})
+            game.resolve_all()
+            return {"action": "clear_blocker", "card": card.name}
         return None
 
     def _try_kill_threat_main(self, game: GameState, idx: int) -> Optional[dict]:
