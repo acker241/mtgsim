@@ -28,6 +28,10 @@ class HumanController:
         return None
 
     # AI-callable interface
+    # do_mulligans calls this directly on AI (not via __call__)
+    def _mulligan(self, game: GameState, idx: int) -> bool:
+        return self._request("mulligan", game, idx, {})
+
     def __call__(self, game: GameState, kind: str, **kwargs):
         idx = kwargs.get("player_idx", game.active_idx)
         if kind == "mulligan":

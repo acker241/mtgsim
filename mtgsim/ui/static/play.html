@@ -303,9 +303,25 @@ function renderControls(w, me, opp) {
       if (card) {
         html += `<div class="target-picker">
           <h3>Cast: ${card.name}</h3>`;
+        // alt-cost handling
         if (card.spectacle_cost) {
-          html += `<label><input type="checkbox" ${useAlt?'checked':''}
-                  onchange='useAlt=this.checked; render()' /> Use alt cost (R)</label> `;
+          const isSpectacle = card.name === "Skewer the Critics" || card.name === "Light Up the Stage";
+          const isWizDiscount = card.name === "Wizard's Lightning";
+          let altLabel = '';
+          let altAvailable = false;
+          if (isSpectacle) {
+            altAvailable = me.spectacle_active;
+            altLabel = `Spectacle {R}${altAvailable ? ' (opp lost life — available!)' : ' (opp must lose life this turn first)'}`;
+          } else if (isWizDiscount) {
+            altAvailable = me.has_wizard;
+            altLabel = `Wizard discount {R}${altAvailable ? ' (you control a Wizard)' : ' (need a Wizard in play)'}`;
+          }
+          if (altAvailable) {
+            html += `<label><input type="checkbox" ${useAlt?'checked':''}
+                    onchange='useAlt=this.checked; render()' /> ${altLabel}</label><br>`;
+          } else {
+            html += `<div style="color:#977;font-size:11px;">${altLabel}</div>`;
+          }
         }
         if (card.needs_targets > 0) {
           html += `<div>Targets selected: ${selectedTargets.length}/${card.needs_targets}</div>`;
@@ -314,7 +330,7 @@ function renderControls(w, me, opp) {
         }
         const canCast = selectedTargets.length >= (card.needs_targets || 0);
         html += `<button class="primary" ${canCast?'':'disabled'} onclick='castSelected()'>Cast</button> `;
-        html += `<button onclick='selectedCardCid=null; selectedTargets=[]; render()'>Cancel</button>`;
+        html += `<button onclick='selectedCardCid=null; selectedTargets=[]; useAlt=false; render()'>Cancel</button>`;
         html += '</div>';
       }
     }

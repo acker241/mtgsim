@@ -523,6 +523,14 @@ def serialize_full_state_play(game, human_side: str) -> dict:
             "city_blessing": p.city_blessing,
             "mulligans": p.mulligans_taken,
             "lost": p.lost,
+            # spectacle gate: did opponent lose life this turn?
+            "spectacle_active": p.opp_lost_life_this_turn,
+            # land plays remaining this turn
+            "lands_played_this_turn": p.lands_played_this_turn,
+            # wizard in play (for Wizard's Lightning discount)
+            "has_wizard": any(c.cdef.is_creature()
+                              and Subtype.WIZARD in c.cdef.subtypes
+                              for c in p.battlefield),
         })
     return out
 
