@@ -68,7 +68,7 @@ class HeuristicAI:
         target_size = 7 - mulls
         if target_size <= 4:
             return False
-        # aggro: needs 2-4 lands and at least 1 cheap (1-2 drop creature/spell)
+        # aggro: 2-4 lands + at least 1 cheap creature
         if self.is_aggro:
             if lands < 2 or lands > 4:
                 return True
@@ -332,10 +332,16 @@ class HeuristicAI:
                 else:
                     score -= 5
             if c.name == "Experimental Frenzy":
-                # only worth if our hand has dead cards (lands + many in hand)
-                pl = game.players[idx]
-                if len(pl.hand) > 3:
-                    score += 30
+                # Frenzy LOCKS hand (can't play from hand). Worth ONLY when hand is empty/low —
+                # next draws via topdeck become free plays. Cast Frenzy when about to run out of gas.
+                pl_for_frenzy = game.players[idx]
+                hand_after_cast = len(pl_for_frenzy.hand) - 1  # subtract Frenzy itself
+                if hand_after_cast <= 1:
+                    score += 40  # excellent: empty hand, all future draws are topdeck-only via Frenzy
+                elif hand_after_cast <= 3:
+                    score += 10  # decent: small hand
+                else:
+                    score -= 30  # bad: locking many cards in hand
             return score
         candidates.sort(key=lambda d: -rank(d))
         best = candidates[0]
@@ -935,16 +941,24 @@ class HeuristicAI:
             return None
         def threat_score(c):
             s = c.power(game) * 2 + c.toughness(game)
+            kws = c.keywords(game)
             if c.name == "Benalish Marshal":
-                s += 20
-            if Keyword.LIFELINK in c.keywords(game):
-                s += 10
-            if Keyword.FLYING in c.keywords(game):
-                s += 3
+                s += 25  # anthem snowballs board
+            if Keyword.LIFELINK in kws:
+                s += 30  # lifelinkers neutralize burn clock — KILL on sight (Hawk + Vampire/Cat tokens)
+            if Keyword.FLYING in kws:
+                s += 4
+            if Keyword.VIGILANCE in kws:
+                s += 5  # vigilance creature attacks AND blocks — double utility
             if c.name == "Venerated Loxodon":
-                s += 8
+                s += 15  # 4/4 + counters distributed to convokers
             if c.name == "Tithe Taker":
-                s += 5
+                s += 12  # 2 power + spirit-on-death trigger ensures replacement body
+            if c.name == "Adanto Vanguard":
+                s += 6   # 3 power; activation drains white (favors red) so not high priority
+            if c.name == "Skymarcher Aspirant":
+                s += 4   # 1 power but can scale; minor priority
+            # NOTE: History of Benalia is an enchantment — burn can't target it. Filter handles.
             return s
         threats.sort(key=threat_score, reverse=True)
         # aggro mode: only spend burn on creatures if HIGH-value threat or lifelink/anthem
@@ -1078,6 +1092,18 @@ class HeuristicAI:
             p = c.power(game)
             if p <= 0:
                 continue
+            # Steam-Kin protection: don't attack if growing (counters >= 2 and not at lethal pressure)
+            # Steam-Kin gets stronger each red spell cast — preserving it lets it scale to 4/4
+            if c.name == "Runaway Steam-Kin":
+                sk_counters = c.counters.get("+1/+1", 0)
+                # if growing and we're not racing/forced, hold back to keep developing
+                if sk_counters >= 1 and not forced and not (racing and my_turns_to_lethal <= 1):
+                    blockers_test = [b for b in opp.battlefield
+                                     if b.cdef.is_creature() and b.can_block(c, game)]
+                    # if any blocker would kill or trade Steam-Kin, skip
+                    threat = any(b.power(game) >= c.toughness(game) - c.damage_marked for b in blockers_test)
+                    if threat:
+                        continue
             # blockers opp could use
             blockers = [b for b in opp.battlefield
                         if b.cdef.is_creature() and b.can_block(c, game)]
@@ -1212,10 +1238,9 @@ class HeuristicAI:
         atk_dies, dying = self._simulate_block(atk, blockers, game)
         # value of attacker (gone if dies)
         atk_val = atk.power(game) + atk.toughness(game)
-        # priority kill bonus
+        # priority kill bonus (only creatures that actually attack — drop Ajani: planeswalker)
         if atk.name in ("Benalish Marshal", "Venerated Loxodon",
-                        "Goblin Chainwhirler", "Rekindling Phoenix",
-                        "Ajani, Adversary of Tyrants"):
+                        "Goblin Chainwhirler", "Rekindling Phoenix"):
             atk_val += 4
         # value of blockers lost
         blockers_lost = 0
