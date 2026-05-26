@@ -641,21 +641,23 @@ class HeuristicAI:
         return None
 
     def _try_steamkin_activation(self, game: GameState, idx: int) -> Optional[dict]:
-        """Activate Steam-Kin (remove 3 counters -> RRR) ONLY when net positive.
+        """Activate Steam-Kin (remove 3 counters -> RRR) when chain value > 3 power loss.
 
         Trade-off:
           - Lose: 3 power AND 3 toughness on Steam-Kin (was X/X, becomes (X-3)/(X-3))
           - Gain: 3 R mana usable THIS PHASE ONLY (rule 106.4)
 
-        Activate if any of:
-          (a) The RRR unlocks a cast that wasn't payable before AND new cast deals >=3 damage
-              (or kills key threat / closes lethal)
-          (b) Steam-Kin is doomed this turn anyway (blocker too big, lethal incoming)
-          (c) Combined with intent: still want to attack but mana is needed for combat trick
+        Chain-aware logic:
+          - Sum value of ALL spells in hand that become castable (or castable extra)
+            after the +RRR injection — multi-spell unlocks justify the activation
+          - Each red spell cast triggers Steam-Kin again (recovers counters toward
+            next activation later)
+          - Frenzy synergy: if Frenzy in play, extra mana also fuels top-of-library
+            plays (estimate +2 effective value per RRR)
+          - Activate if: unlocked_total_value >= 3 OR >= 2 cards unlocked OR
+            Frenzy in play OR Steam-Kin doomed this turn anyway
         """
         pl = game.players[idx]
-        opp = self._opp(game, idx)
-        # find Steam-Kin with >= 3 counters
         sk = None
         for c in pl.battlefield:
             if c.name == "Runaway Steam-Kin" and c.counters.get("+1/+1", 0) >= 3:
@@ -663,14 +665,17 @@ class HeuristicAI:
                 break
         if sk is None:
             return None
-        # available mana NOW (lands + pool)
         pool = self._available_mana(game, idx)
-        # mana after activation: add 3 R
         pool_after = dict(pool)
         pool_after["R"] = pool_after.get("R", 0) + 3
-        # find spells in hand castable AFTER but NOT castable now (unlocked by RRR)
-        unlocked_value = 0
-        unlocked_card = None
+        # spells in hand we'd unlock — sum damage / creature value across ALL of them
+        unlocked_total = 0
+        unlocked_count = 0
+        # also: spells already castable now whose extra mana lets us chain SECOND spell
+        # we approximate by enumerating cards castable now AND cards castable after,
+        # counting NET extra plays.
+        castable_now = 0
+        castable_after = 0
         for c in pl.hand:
             cost = c.cdef.cost
             if not cost:
@@ -682,25 +687,39 @@ class HeuristicAI:
                 cost_eff = c.cdef.spectacle_cost
             now_ok = self._can_pay(pool, cost_eff)
             after_ok = self._can_pay(pool_after, cost_eff)
+            if now_ok:
+                castable_now += 1
+            if after_ok:
+                castable_after += 1
             if not now_ok and after_ok:
+                unlocked_count += 1
                 v = self._spell_damage_estimate(c, 0)
                 if c.cdef.is_creature() and c.cdef.power is not None:
                     v = max(v, c.cdef.power + c.cdef.toughness)
-                if v > unlocked_value:
-                    unlocked_value = v
-                    unlocked_card = c
-        # heuristic: activate if unlocked value >= 3 (worth at least the 3 power loss)
-        # OR lethal (unlocked_value + already_payable_burn >= opp.life)
-        # OR Steam-Kin is about to die (already damaged near lethal)
+                if v == 0:
+                    v = 1  # at least counts as a play
+                unlocked_total += v
+        # Frenzy synergy: each extra mana fuels topdeck plays
+        frenzy_active = bool(pl.ai_data.get("experimental_frenzy"))
+        if frenzy_active:
+            unlocked_total += 4  # significant bonus — chain potential huge
         sk_dying = sk.damage_marked > 0 and (sk.toughness(game) - sk.damage_marked) <= 0
-        if unlocked_value >= 3 or sk_dying:
-            # execute activation
+        # final decision
+        should_activate = (
+            unlocked_total >= 3 or
+            unlocked_count >= 2 or
+            frenzy_active or
+            sk_dying
+        )
+        if should_activate:
             for act in sk.cdef.activated:
                 if act.cost_fn(game, sk):
                     act.effect(game, pl, sk, [])
                     game.observer.emit("steamkin_activate", game,
-                                       {"unlocked": unlocked_card.name if unlocked_card else None,
-                                        "value": unlocked_value, "sk_dying": sk_dying})
+                                       {"unlocked_count": unlocked_count,
+                                        "unlocked_total": unlocked_total,
+                                        "frenzy": frenzy_active,
+                                        "sk_dying": sk_dying})
                     pl.ai_data["steamkin_activated"] = pl.ai_data.get("steamkin_activated", 0) + 1
                     return {"action": "steamkin_activate"}
         return None
