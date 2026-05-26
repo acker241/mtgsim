@@ -14,8 +14,8 @@ from ..ai.heuristic import HeuristicAI
 from .deck import build_library, build_sideboard
 
 
-def make_heuristic(name, rng):
-    return HeuristicAI(name=name, rng=rng)
+def make_heuristic(name, rng, archetype="midrange"):
+    return HeuristicAI(name=name, rng=rng, archetype=archetype)
 
 
 @dataclass
@@ -23,6 +23,9 @@ class DeckSpec:
     name: str
     main: list   # [(CardDef, count), ...]
     sideboard: list
+    archetype: str = "midrange"   # 'aggro' | 'midrange' | 'control'
+    # sideboard plan: {opp_archetype: [(in_card_name, out_card_name, count), ...]}
+    sb_plan: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -70,8 +73,15 @@ def setup_game(deck0: DeckSpec, deck1: DeckSpec, rng: random.Random,
     game.next_cid = next_cid
     game.active_idx = play_first_idx
     factory = ai_factory or make_heuristic
-    ai0 = factory(f"AI:{deck0.name}", rng)
-    ai1 = factory(f"AI:{deck1.name}", rng)
+    # pass archetype if factory accepts it
+    import inspect
+    sig = inspect.signature(factory)
+    if "archetype" in sig.parameters:
+        ai0 = factory(f"AI:{deck0.name}", rng, archetype=deck0.archetype)
+        ai1 = factory(f"AI:{deck1.name}", rng, archetype=deck1.archetype)
+    else:
+        ai0 = factory(f"AI:{deck0.name}", rng)
+        ai1 = factory(f"AI:{deck1.name}", rng)
     return game, ai0, ai1
 
 
@@ -169,6 +179,29 @@ def play_game(deck0: DeckSpec, deck1: DeckSpec, rng: random.Random,
     return res
 
 
+def _apply_sb(spec: DeckSpec, opp_archetype: str) -> DeckSpec:
+    """Return new DeckSpec with sideboard plan applied for given opponent archetype."""
+    plan = spec.sb_plan.get(opp_archetype) or []
+    if not plan:
+        return spec
+    # build new main: copy then swap
+    main_counts = {cdef.name: [cdef, count] for cdef, count in spec.main}
+    sb_counts = {cdef.name: [cdef, count] for cdef, count in spec.sideboard}
+    for in_name, out_name, n in plan:
+        if in_name in sb_counts and out_name in main_counts:
+            take = min(n, sb_counts[in_name][1], main_counts[out_name][1])
+            sb_counts[in_name][1] -= take
+            main_counts[out_name][1] -= take
+            # add to main (or merge)
+            if in_name in main_counts:
+                main_counts[in_name][1] += take
+            else:
+                main_counts[in_name] = [sb_counts[in_name][0], take]
+    new_main = [(cdef, cnt) for cdef, cnt in main_counts.values() if cnt > 0]
+    return DeckSpec(name=spec.name, main=new_main, sideboard=spec.sideboard,
+                    archetype=spec.archetype, sb_plan=spec.sb_plan)
+
+
 def play_match(deck0: DeckSpec, deck1: DeckSpec, rng: random.Random,
                observer: Observer = NULL_OBSERVER, max_turns: int = 25,
                match_id: int = 0,
@@ -179,15 +212,21 @@ def play_match(deck0: DeckSpec, deck1: DeckSpec, rng: random.Random,
     if recorder is not None:
         recorder.start_match(match_id, deck0.name, deck1.name)
     play_first = 0
+    # game 1 uses main decks as-is
+    deck0_g = deck0
+    deck1_g = deck1
     for game_idx in range(3):
         if res.wins0 >= 2 or res.wins1 >= 2:
             break
-        # per-game metrics; aggregated into match-level by appending
+        # game 2+: apply sideboard plan
+        if game_idx >= 1:
+            deck0_g = _apply_sb(deck0, deck1.archetype)
+            deck1_g = _apply_sb(deck1, deck0.archetype)
         mc = None
         if collect_metrics:
             from ..data.metrics import MetricsCollector
             mc = MetricsCollector()
-        gr = play_game(deck0, deck1, rng, play_first_idx=play_first,
+        gr = play_game(deck0_g, deck1_g, rng, play_first_idx=play_first,
                        observer=observer, max_turns=max_turns,
                        game_id=match_id * 10 + game_idx,
                        ai_factory=ai_factory,

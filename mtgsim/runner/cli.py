@@ -13,16 +13,22 @@ from .decks import mono_red, mono_white
 
 def _worker(args):
     (seed, max_turns, ai_mode, n_sims, rec_dir, rec_mode, rec_sample,
-     compress, collect_metrics) = args
+     compress, collect_metrics, model_path) = args
     rng = random.Random(seed)
     d0, d1 = mono_red(), mono_white()
     ai_factory = None
     if ai_mode == "mcts":
         from ..ai.mcts_ai import MctsAI
         sims = n_sims
+        mpath = model_path
         def ai_factory(name, rng_):
+            policy = None
+            if mpath:
+                from ..ai.nn import NeuralPolicy
+                policy = NeuralPolicy(model_path=mpath)
             return MctsAI(name=name, rng=rng_, n_sims=sims, max_rollout_turns=4,
-                          mcts_for_main=True, mcts_for_attacks=False, mcts_for_blocks=False)
+                          mcts_for_main=True, mcts_for_attacks=False, mcts_for_blocks=False,
+                          policy=policy)
     recorder = None
     if rec_dir:
         from ..data.recorder import Recorder
@@ -38,11 +44,12 @@ def run_headless(n_matches: int, workers: int, seed: int, max_turns: int,
                  ai_mode: str = "heuristic", n_sims: int = 16,
                  rec_dir: Optional[str] = None, rec_mode: str = "summary",
                  rec_sample: float = 1.0, compress: bool = True,
-                 collect_metrics: bool = False):
+                 collect_metrics: bool = False,
+                 model_path: Optional[str] = None):
     base_rng = random.Random(seed)
     seeds = [base_rng.randint(0, 2**31 - 1) for _ in range(n_matches)]
     args = [(s, max_turns, ai_mode, n_sims, rec_dir, rec_mode, rec_sample,
-             compress, collect_metrics) for s in seeds]
+             compress, collect_metrics, model_path) for s in seeds]
     t0 = time.time()
     if workers == 1:
         results = [_worker(a) for a in args]
@@ -85,6 +92,8 @@ def main():
     ap.add_argument("--no-compress", action="store_true", help="Disable gzip (default: gzipped)")
     ap.add_argument("--metrics", action="store_true",
                     help="Collect per-match tactical metrics (Chainwhirler turn, spectacle usage, lethal-miss, etc)")
+    ap.add_argument("--use-model", type=str, default=None,
+                    help="Path to trained NN model (.pt). Used as MCTS policy prior.")
     ap.add_argument("--record-sample", type=float, default=1.0,
                     help="Fraction of matches to record (0..1)")
     args = ap.parse_args()
@@ -100,7 +109,8 @@ def main():
                      ai_mode=args.ai, n_sims=args.n_sims,
                      rec_dir=args.record_to, rec_mode=args.record_mode,
                      rec_sample=args.record_sample, compress=compress,
-                     collect_metrics=args.metrics)
+                     collect_metrics=args.metrics,
+                     model_path=args.use_model)
 
 
 if __name__ == "__main__":

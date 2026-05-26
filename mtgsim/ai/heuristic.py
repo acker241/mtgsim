@@ -13,10 +13,12 @@ from ..engine import actions as eng_actions
 class HeuristicAI:
     """Single AI instance per game. Both players in a match use independent copies."""
 
-    def __init__(self, name: str = "AI", rng: Optional[random.Random] = None):
+    def __init__(self, name: str = "AI", rng: Optional[random.Random] = None,
+                 archetype: str = "midrange"):
         self.name = name
         self.rng = rng or random.Random()
-        # cached info per step
+        self.archetype = archetype  # 'aggro' | 'midrange' | 'control'
+        self.is_aggro = (archetype == "aggro")
         self._priority_pass_for: set = set()
 
     # ---------------- Top-level dispatcher ----------------
@@ -38,20 +40,27 @@ class HeuristicAI:
     # ---------------- Mulligan ----------------
 
     def _mulligan(self, game: GameState, idx: int) -> bool:
-        """Return True to mulligan, False to keep. London mulligan."""
+        """Return True to mulligan, False to keep. London mulligan. Stricter for aggro."""
         pl = game.players[idx]
         lands = sum(1 for c in pl.hand if c.cdef.is_land())
-        nonlands = len(pl.hand) - lands
         mulls = pl.mulligans_taken
-        # heuristic: with 7 cards, keep if 2-5 lands; with 6, keep 2-5; force keep at 4 cards
         if mulls >= 3:
             return False
         target_size = 7 - mulls
         if target_size <= 4:
             return False
+        # aggro: needs 2-4 lands and at least 1 cheap (1-2 drop creature/spell)
+        if self.is_aggro:
+            if lands < 2 or lands > 4:
+                return True
+            cheap_creature = sum(1 for c in pl.hand
+                                 if c.cdef.is_creature() and c.cdef.cost and c.cdef.cost.cmc() <= 2)
+            if cheap_creature == 0 and target_size >= 6:
+                return True
+            return False
+        # midrange/control: more flexible
         if lands < 2 or lands > 5:
             return True
-        # also keep if has at least one 1-drop or 2-drop
         cheap = sum(1 for c in pl.hand if c.cdef.cost and c.cdef.cost.cmc() <= 2 and not c.cdef.is_land())
         if cheap == 0 and target_size == 7:
             return True
@@ -181,6 +190,15 @@ class HeuristicAI:
         pl = game.players[idx]
         pool = self._available_mana(game, idx)
         candidates = []
+        in_main1 = (game.step.name == "PRECOMBAT_MAIN")
+        # hold-mana check: if Chainwhirler in hand AND have ≥3 mountains untap AND Chainwhirler castable now, skip everything else this iteration
+        chainwhirler_in_hand = any(c.name == "Goblin Chainwhirler" for c in pl.hand)
+        mountains_untap = sum(1 for c in pl.battlefield
+                              if c.cdef.is_land() and not c.tapped
+                              and any(s.name == "MOUNTAIN" for s in c.cdef.subtypes))
+        # if we can cast Chainwhirler RRR THIS turn, prioritize it: skip 1-drops that would tap mountains
+        reserve_for_chainwhirler = (chainwhirler_in_hand and mountains_untap >= 3
+                                    and pool.get("R", 0) >= 3)
         for c in pl.hand:
             if c.cdef.is_land():
                 continue
@@ -195,6 +213,17 @@ class HeuristicAI:
             if c.cdef.spectacle_cost is not None and c.cdef.is_sorcery() and pl.opp_lost_life_this_turn:
                 use_spec = True
                 cost_eff = c.cdef.spectacle_cost
+            # skip spectacle sorceries at full cost in main1 — wait for combat damage to enable spectacle
+            if (c.name in ("Skewer the Critics", "Light Up the Stage")
+                    and not use_spec and in_main1):
+                continue
+            # hold mana: if we'd cast a non-Chainwhirler card that taps mountains needed for Chainwhirler this turn, skip
+            if reserve_for_chainwhirler and c.name != "Goblin Chainwhirler":
+                # if casting this would leave us unable to cast Chainwhirler (still need RRR)
+                # — check post-cost mountains untap
+                cost_r_needed = cost_eff.colored_required().get("R", 0) + cost_eff.symbols.get("GENERIC", 0)
+                if mountains_untap - cost_r_needed < 3:
+                    continue
             if c.cdef.has_x:
                 # X spell: spend everything (Banefire)
                 x = max(0, self._total_mana(pool) - cost.symbols.get(GENERIC, 0)
@@ -248,9 +277,16 @@ class HeuristicAI:
                     score -= 20
                 score += 25
             if c.name == "Skewer the Critics" and not d["use_spec"]:
-                score -= 5  # better at spectacle
+                # heavily penalize full-cost spectacle sorcery in main1; cast in main2 after combat
+                if game.step.name == "PRECOMBAT_MAIN":
+                    score -= 80
+                else:
+                    score -= 5
             if c.name == "Light Up the Stage" and not d["use_spec"]:
-                score -= 5
+                if game.step.name == "PRECOMBAT_MAIN":
+                    score -= 80
+                else:
+                    score -= 5
             if c.name == "Experimental Frenzy":
                 # only worth if our hand has dead cards (lands + many in hand)
                 pl = game.players[idx]
@@ -279,8 +315,6 @@ class HeuristicAI:
         # record convoke list on card for Loxodon ETB
         if best["convoke"]:
             c.ai_choice = best["convoke"]
-        game.observer.emit("cast", game, {"player_idx": idx, "card": c.name,
-                                          "spec": best["use_spec"], "x": best["x"]})
         game.resolve_all()
         return {"action": "cast", "card": c.name}
 
@@ -467,29 +501,63 @@ class HeuristicAI:
         pl = game.players[idx]
         if pl.lost or game.is_over():
             return None
-        # only respond on certain steps
-        opp = self._opp(game, idx)
-        # Active-only burn at end of opp turn (for AP-on-its-own-turn-end? no, AP is the one whose turn ends - we want NAP to do stuff)
-        # In our model, the active player is the turn owner; opponent (nonactive) is the one to dump burn at end step
         is_my_turn = (idx == game.active_idx)
+        burn_windows_nap = (
+            Step.UPKEEP, Step.PRECOMBAT_MAIN, Step.BEGIN_COMBAT,
+            Step.DECLARE_ATTACKERS, Step.DECLARE_BLOCKERS,
+            Step.POSTCOMBAT_MAIN, Step.END_STEP,
+        )
 
-        # 1) Lethal burn at end of opp turn
-        if not is_my_turn and game.step in (Step.END_STEP, Step.DECLARE_BLOCKERS, Step.DECLARE_ATTACKERS):
+        # NAP windows: cast burn / removal at opp's turn
+        if not is_my_turn and game.step in burn_windows_nap:
+            # 1) lethal burn if total available burn kills opp
             act = self._try_cast_burn(game, idx, target_face_priority=True)
             if act:
                 return act
+            # 2) kill key threat before it attacks/triggers (BEGIN_COMBAT + DECLARE_ATTACKERS most valuable)
+            if game.step in (Step.UPKEEP, Step.PRECOMBAT_MAIN, Step.BEGIN_COMBAT, Step.DECLARE_ATTACKERS):
+                act = self._try_kill_threat_main(game, idx)
+                if act:
+                    return act
+            # 3) end-step dump: chip burn at face when end of opp turn (use mana before untap)
+            if game.step == Step.END_STEP:
+                act = self._try_chip_burn_face_priority(game, idx)
+                if act:
+                    return act
 
-        # 2) Removal as instant on opp's attackers / dangerous threats
-        # 3) Cast Unbreakable Formation if my creatures about to die in combat
+        # AP windows during combat: protect creatures
         if is_my_turn and game.step == Step.DECLARE_BLOCKERS:
             act = self._try_cast_unbreakable_formation(game, idx)
             if act:
                 return act
 
-        # 4) Adanto Vanguard pay 4 life if it's about to die
-        # (skip for simplicity)
+        return None
 
-        # 5) Burn on my turn during main if floating mana otherwise wasted — handled in main
+    def _try_chip_burn_face_priority(self, game: GameState, idx: int) -> Optional[dict]:
+        """End-of-opp-turn: dump any burn that we can pay at face. Don't waste mana before our untap."""
+        pl = game.players[idx]
+        opp = self._opp(game, idx)
+        if opp.lost:
+            return None
+        pool = self._available_mana(game, idx)
+        for c in pl.hand:
+            if not c.cdef.is_instant():
+                continue
+            dmg = self._spell_damage_estimate(c, 0)
+            if dmg <= 0:
+                continue
+            cost_eff = c.cdef.cost
+            use_alt = False
+            if c.name == "Wizard's Lightning" and self._has_wizard(game, idx):
+                cost_eff = c.cdef.spectacle_cost
+                use_alt = True
+            if not self._can_pay(pool, cost_eff):
+                continue
+            ok = eng_actions.cast_spell(game, idx, c, targets=[opp], use_spectacle=use_alt)
+            if ok:
+                game.observer.emit("end_step_burn", game, {"card": c.name})
+                game.resolve_all()
+                return {"action": "end_step_burn"}
         return None
 
     def _try_steamkin_activation(self, game: GameState, idx: int) -> Optional[dict]:
@@ -676,8 +744,9 @@ class HeuristicAI:
                 s += 5
             return s
         threats.sort(key=threat_score, reverse=True)
-        # only kill if score >= threshold
-        if threat_score(threats[0]) < 6:
+        # aggro mode: only spend burn on creatures if HIGH-value threat or lifelink/anthem
+        threshold = 12 if self.is_aggro else 6
+        if threat_score(threats[0]) < threshold:
             return None
         pool = self._available_mana(game, idx)
         # find cheapest burn that can kill highest threat
@@ -807,11 +876,16 @@ class HeuristicAI:
                 if b.power(game) >= t and p < (b.toughness(game) - b.damage_marked) and Keyword.LIFELINK not in c.keywords(game):
                     bad = True
                     break
-            # mono-red bias: attack anyway if life lead — but for general AI: if life lead big, attack; if behind, attack
-            if bad and opp.life > 6 and pl.life > 8:
-                # don't suicide unless racing
-                # but attack if creature would die soon anyway? skip subtlety
+            # aggro: attack even if bad trade (clock matters more than board)
+            if bad and not self.is_aggro and opp.life > 6 and pl.life > 8:
                 continue
+            # aggro: skip only if creature dies AND deals 0 damage (e.g., flying blocker shuts down ground)
+            if self.is_aggro and bad:
+                # check if attacker would deal damage despite trade
+                blocker_min_tough = min((b.toughness(game) - b.damage_marked) for b in blockers)
+                if p < blocker_min_tough:
+                    # would deal 0 damage — skip
+                    continue
             atks.append(c)
         return atks
 

@@ -210,7 +210,13 @@ def cast_spell(game: GameState, player_idx: int, card: Card,
     if cdef.is_creature():
         pl.creatures_cast_this_turn += 1
     game.log(f"P{player_idx} casts {card.name} (cost {cost.symbols}{' spectacle' if use_spectacle else ''})")
-    # fire CAST event
+    # emit observer event (single source of truth for "spell cast")
+    game.observer.emit("cast", game, {
+        "player_idx": player_idx, "card": card.name,
+        "spec": use_spectacle, "x": x,
+        "convoke": [c.name for c in (convoke_creatures or [])],
+    })
+    # fire CAST trigger event (for triggered abilities like Steam-Kin)
     game.fire_event(TriggerEvent.CAST, {"card": card, "controller_idx": player_idx})
     return True
 

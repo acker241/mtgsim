@@ -99,18 +99,27 @@ class MetricsCollector:
                     self.m[f"wiz_lightning_disc_p{active}"] += 1
                 else:
                     self.m[f"wiz_lightning_full_p{active}"] += 1
+        elif kind == "steamkin_activate":
+            # use game.active_idx (only active player can activate during own main)
+            active = ev.active_idx
+            self.m[f"steamkin_activated_p{active}"] += 1
         elif kind == "game_end":
             self._snapshot_game_end(ev)
 
     def snapshot_end_of_turn(self, game):
-        """Called by hook at end_step. Detect lethal-miss."""
+        """Called by hook at end_step. Detect lethal-miss AND snapshot Steam-Kin counters."""
         ap_idx = game.active_idx
         opp = game.players[1 - ap_idx]
+        # snapshot Steam-Kin counters at end of turn (most accurate timing)
+        for pi in (0, 1):
+            for c in game.players[pi].battlefield:
+                if c.name == "Runaway Steam-Kin":
+                    cnt = c.counters.get("+1/+1", 0)
+                    if cnt > self.m[f"steamkin_max_counters_p{pi}"]:
+                        self.m[f"steamkin_max_counters_p{pi}"] = cnt
         if opp.lost:
             return
         ap = game.players[ap_idx]
-        # burn potential = sum of damage from instants+sorceries castable this turn
-        # simple: sum dmg of all burn in hand (not actually checking mana)
         total_burn = 0
         for c in ap.hand:
             if not (c.cdef.is_instant() or c.cdef.is_sorcery()):

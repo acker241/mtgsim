@@ -16,4 +16,6 @@ env/
 .DS_Store
 Thumbs.db
 *.log
+selfplay_runs/
 # do NOT ignore data/ — it's the recorded match data and required for analysis
+# models/ kept committed for portability of trained nets

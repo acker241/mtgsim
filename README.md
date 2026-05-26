@@ -34,6 +34,16 @@ py -m mtgsim.runner.cli --matches 2000 --workers 8 \
 
 # analyze recorded matches
 py -m mtgsim.scripts.analyze data
+
+# train NN on recorded decisions
+py -m mtgsim.scripts.train data --epochs 20 --out models/policy.pt
+
+# run MCTS guided by trained NN
+py -m mtgsim.runner.cli --matches 100 --workers 4 --ai mcts --n-sims 16 \
+    --use-model models/policy.pt
+
+# full self-play loop (multi-iteration)
+py -m mtgsim.scripts.selfplay --iters 3 --games-per-iter 500 --workers 8
 ```
 
 ## Layout
@@ -53,11 +63,17 @@ docs/
   NEXT_STEPS.md  # what's broken, what to do, NN roadmap
 ```
 
-## Current results (heuristic AI, 2000 BO3)
+## Current results (heuristic AI + sideboard, 2000 BO3)
 
-Mono-Red ~30%  /  Mono-White ~70%
+Mono-Red **47.3%**  /  Mono-White **52.6%** (close to real meta).
 
-Red is underperforming vs. real meta (~50%). See [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) for diagnosed bugs and fix plan.
+Improvements that closed the gap:
+- Mana pool empties between phases (rule 106.4 fix)
+- Aggro mode flag: stricter mulligan, default burn → face, attack through bad trades
+- Spectacle sequencing: skip Skewer/LightUp full-cost in main1 (wait for combat trigger)
+- Steam-Kin RRR activation with utility check (only if net positive)
+- Wizard's Lightning chip burn in own main when wizard out
+- Per-archetype sideboard swap between BO3 games (+10% red winrate)
 
 ## NN-ready hooks
 
