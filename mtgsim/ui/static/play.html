@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>MTG Play — Human vs AI</title>
+<style>
+  * { box-sizing: border-box; }
+  body { background:#0c0c10; color:#e6e6e6; font-family:'JetBrains Mono', Menlo, monospace; margin:0; padding:0; font-size:13px; }
+  header { background:#1a1a22; padding:8px 14px; border-bottom:1px solid #2a2a36; display:flex; gap:12px; align-items:center; }
+  header h1 { font-size:14px; margin:0; color:#fafaf7; }
+  button { background:#2a2a36; color:#e6e6e6; border:1px solid #3a3a48; padding:6px 12px; cursor:pointer; font-family:inherit; font-size:12px; border-radius:3px; }
+  button:hover:not(:disabled) { background:#3a3a48; }
+  button:disabled { opacity:0.4; cursor:not-allowed; }
+  button.primary { background:#5a3a1f; }
+  button.danger { background:#5a1f1f; }
+  button.attack-toggle { background:#5a2020; }
+  button.attack-toggle.on { background:#aa3333; color:#fff; }
+  input[type=number] { width:80px; background:#2a2a36; color:#e6e6e6; border:1px solid #3a3a48; padding:4px; }
+  #main { display:grid; grid-template-rows: auto 1fr auto; height:100vh; }
+  #board { display:grid; grid-template-rows: 1fr auto 1fr; gap:8px; padding:8px; overflow-y:auto; }
+  .player-zone { background:#15151c; border:1px solid #2a2a36; border-radius:4px; padding:8px; }
+  .player-zone.opp { border-left:3px solid #d6d6d6; }
+  .player-zone.me { border-left:3px solid #aa3333; }
+  .player-zone.active { background:#22222e; }
+  .phead { display:flex; justify-content:space-between; align-items:center; }
+  .pname { font-weight:bold; }
+  .plife { font-size:18px; color:#ffd; }
+  .plife.low { color:#ff8888; }
+  .pmeta { color:#778; font-size:11px; margin:4px 0; }
+  .zone-label { color:#9aa; font-size:10px; text-transform:uppercase; margin-top:6px; }
+  .row { display:flex; flex-wrap:wrap; gap:4px; min-height:28px; align-items:center; padding:2px 0; }
+  .card { display:inline-flex; flex-direction:column; padding:4px 6px; border-radius:3px; font-size:11px;
+          background:#2a2a36; border:1px solid #3a3a48; min-width:60px; cursor:default; }
+  .card.creature { background:#3a2a2a; }
+  .card.creature.attacking { background:#aa3333; color:#fff; }
+  .card.creature.blocking { background:#3a5a3a; }
+  .card.land { background:#2a3a2a; color:#9c9; }
+  .card.tap { opacity:0.5; transform:rotate(2deg); }
+  .card.token { font-style:italic; }
+  .card.selected { outline:2px solid #ffd; }
+  .card.targetable { outline:1px dashed #9cf; cursor:pointer; }
+  .card.in-hand { cursor:pointer; background:#1a2a3a; border-color:#3a5a7a; }
+  .card.in-hand:hover { background:#2a3a4a; }
+  .card .name { font-weight:bold; }
+  .card .stats { color:#9c9; }
+  .card .cost { color:#fc9; font-size:10px; }
+  .stack { background:#0a0a14; padding:6px; border-radius:3px; margin:6px 0; }
+  #controls { background:#1a1a22; padding:10px 14px; border-top:1px solid #2a2a36; }
+  #status { color:#ffd; margin-bottom:6px; font-weight:bold; }
+  .ctrl-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px; }
+  #log { background:#0a0a0e; padding:8px; max-height:140px; overflow-y:auto; font-size:10px; color:#778; line-height:1.4; }
+  #log .l { padding:1px 0; }
+  #log .cast { color:#ff9; }
+  #log .end { color:#9f9; }
+  #log .combat { color:#f99; }
+  .target-picker { background:#1a1a22; padding:8px; border:1px solid #aa6; border-radius:3px; margin:6px 0; }
+  .target-picker h3 { margin:0 0 6px; font-size:12px; color:#ffd; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📜 MTG: Mono-Red Aggro vs AI Mono-White</h1>
+  <button id="btn-new" class="primary">New Game</button>
+  <input id="seed-input" type="number" placeholder="seed (opt)" />
+  <span id="result" style="color:#9f9;"></span>
+</header>
+
+<div id="main">
+  <div id="board">
+    <div id="opp-zone" class="player-zone opp"></div>
+    <div class="stack" id="stack-view">Stack: empty</div>
+    <div id="me-zone" class="player-zone me"></div>
+  </div>
+  <div id="controls">
+    <div id="status">Click "New Game" to start</div>
+    <div id="ctrl-area"></div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+let ws = null;
+let snap = null;
+// per-decision local state
+let selectedCardCid = null;
+let selectedTargets = [];
+let toggledAttackers = new Set();
+let pendingBlocks = {}; // {attacker_cid: [blocker_cids]}
+let blockingFor = null; // current attacker being assigned blockers
+let useAlt = false;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/play_ws');
+  ws.onmessage = (e) => {
+    try { snap = JSON.parse(e.data); render(); } catch {}
+  };
+}
+connect();
+
+document.getElementById('btn-new').onclick = async () => {
+  const seedV = document.getElementById('seed-input').value;
+  const params = new URLSearchParams();
+  if (seedV) params.set('seed', seedV);
+  params.set('side', 'red');
+  await fetch('/api/play/start?' + params.toString(), {method:'POST'});
+  // reset local
+  selectedCardCid = null; selectedTargets = []; toggledAttackers.clear();
+  pendingBlocks = {}; blockingFor = null;
+};
+
+function submit(action) {
+  ws.send(JSON.stringify({cmd:'submit', action}));
+  selectedCardCid = null; selectedTargets = [];
+  toggledAttackers.clear(); pendingBlocks = {}; blockingFor = null;
+}
+
+function renderCard(c, mode) {
+  // mode: 'bf' | 'hand' | 'gy'
+  const cls = c.is_land ? 'land' : (c.is_creature ? 'creature' : '');
+  const tap = c.tap ? 'tap' : '';
+  const atk = c.attacking || toggledAttackers.has(c.cid) ? 'attacking' : '';
+  const blk = c.blocking && c.blocking.length ? 'blocking' : '';
+  const tok = c.is_token ? 'token' : '';
+  const sel = (c.cid === selectedCardCid || selectedTargets.includes(c.cid)) ? 'selected' : '';
+  const inHand = mode === 'hand' ? 'in-hand' : '';
+  let label = c.name;
+  if (c.is_creature && c.p != null) {
+    const p = c.p_eff != null ? c.p_eff : c.p;
+    const t = c.t_eff != null ? c.t_eff : c.t;
+    label += ` ${p}/${t}`;
+  }
+  if (c.counters && c.counters.loyalty) label += ` [${c.counters.loyalty}]`;
+  let cost = '';
+  if (c.cost && Object.keys(c.cost).length) {
+    cost = Object.entries(c.cost).map(([k,v]) => k === 'GENERIC' ? v : k.repeat(v)).join('');
+  }
+  const handler = mode === 'hand' ? `onclick="clickHand(${c.cid})"` :
+                  (canBeTarget(c) ? `onclick="clickTarget(${c.cid})"` : '');
+  return `<div class="card ${cls} ${tap} ${atk} ${blk} ${tok} ${sel} ${inHand}" ${handler}
+                title="${c.name}${c.counters ? ' counters: ' + JSON.stringify(c.counters) : ''}">
+            <span class="name">${label}</span>
+            ${cost ? `<span class="cost">{${cost}}</span>` : ''}
+          </div>`;
+}
+
+function canBeTarget(c) {
+  if (!snap || snap.waiting_for !== 'main') return false;
+  if (selectedCardCid == null) return false;
+  // simplistic: any opp creature or own creature can be target depending on spell
+  return true;
+}
+
+function clickHand(cid) {
+  if (!snap || snap.waiting_for !== 'main') return;
+  const me = currentMe();
+  const card = me.hand.find(c => c.cid === cid);
+  if (!card) return;
+  // toggle selection
+  if (selectedCardCid === cid) { selectedCardCid = null; selectedTargets = []; render(); return; }
+  selectedCardCid = cid;
+  selectedTargets = [];
+  // if no targets needed, auto-cast/play
+  if (card.is_land) {
+    submit({action:'play_land', card_cid: cid});
+    return;
+  }
+  if (!card.needs_targets) {
+    castSelected();
+    return;
+  }
+  render();
+}
+
+function clickTarget(cid) {
+  if (selectedCardCid == null) return;
+  if (selectedTargets.includes(cid)) {
+    selectedTargets = selectedTargets.filter(x => x !== cid);
+  } else {
+    selectedTargets.push(cid);
+  }
+  render();
+}
+
+function clickFaceTarget(playerRef) {
+  if (selectedCardCid == null) return;
+  selectedTargets.push(playerRef);  // -1 self, -2 opp
+  render();
+}
+
+function castSelected() {
+  if (selectedCardCid == null) return;
+  submit({action:'cast', card_cid: selectedCardCid, target_cids: selectedTargets,
+          use_alt_cost: useAlt, convoke_cids: []});
+}
+
+function toggleAttacker(cid) {
+  if (toggledAttackers.has(cid)) toggledAttackers.delete(cid);
+  else toggledAttackers.add(cid);
+  render();
+}
+
+function submitAttackers() {
+  submit({attacker_cids: Array.from(toggledAttackers)});
+}
+
+function startBlockFor(attackerCid) {
+  blockingFor = attackerCid;
+  render();
+}
+
+function assignBlocker(blockerCid) {
+  if (blockingFor == null) return;
+  if (!pendingBlocks[blockingFor]) pendingBlocks[blockingFor] = [];
+  if (!pendingBlocks[blockingFor].includes(blockerCid)) {
+    pendingBlocks[blockingFor].push(blockerCid);
+  }
+  render();
+}
+
+function submitBlocks() {
+  submit({block_map: pendingBlocks});
+}
+
+function currentMe() { return snap.state.players[snap.state.human_idx]; }
+function currentOpp() { return snap.state.players[1 - snap.state.human_idx]; }
+
+function render() {
+  if (!snap || !snap.ready) {
+    document.getElementById('status').textContent = 'Click "New Game" to start';
+    return;
+  }
+  const s = snap.state;
+  const me = currentMe();
+  const opp = currentOpp();
+  const w = snap.waiting_for;
+  // result
+  if (snap.game_done && snap.result) {
+    document.getElementById('result').textContent =
+      `WINNER: ${snap.result.winner || 'draw'} in ${snap.result.turns} turns`;
+  }
+  // status
+  let statusTxt = `T${s.turn} ${s.step} | active P${s.active_idx} | stack=${s.stack_size}`;
+  if (w === 'main') statusTxt += ' | YOUR MAIN — click hand card to cast or pass';
+  else if (w === 'declare_attackers') statusTxt += ' | DECLARE ATTACKERS — click creatures to toggle';
+  else if (w === 'declare_blockers') statusTxt += ' | DECLARE BLOCKERS — pick attacker then click blocker';
+  else if (w === 'mulligan') statusTxt += ' | MULLIGAN DECISION';
+  else statusTxt += ' | (AI thinking...)';
+  document.getElementById('status').textContent = statusTxt;
+  // zones
+  document.getElementById('opp-zone').innerHTML = renderPlayer(opp, false, s);
+  document.getElementById('me-zone').innerHTML = renderPlayer(me, true, s);
+  document.getElementById('stack-view').textContent = `Stack: ${s.stack_size}`;
+  // controls
+  document.getElementById('ctrl-area').innerHTML = renderControls(w, me, opp);
+  // log
+  document.getElementById('log').innerHTML = (snap.log || []).map(l => {
+    let cls = '';
+    if (l.includes('cast')) cls = 'cast';
+    else if (l.includes('GAME END')) cls = 'end';
+    else if (l.includes('damage') || l.includes('attacks')) cls = 'combat';
+    return `<div class="l ${cls}">${l.replace(/</g,'&lt;')}</div>`;
+  }).join('');
+  // auto scroll log
+  const logEl = document.getElementById('log'); logEl.scrollTop = logEl.scrollHeight;
+}
+
+function renderPlayer(p, isMe, s) {
+  const cls = isMe ? 'me' : 'opp';
+  const active = s.active_idx === p.idx ? 'active' : '';
+  const low = p.life <= 6 ? 'low' : '';
+  const lands = p.battlefield.filter(c => c.is_land);
+  const creatures = p.battlefield.filter(c => c.is_creature);
+  const others = p.battlefield.filter(c => !c.is_land && !c.is_creature);
+  const mana = Object.entries(p.mana || {}).filter(([k,v])=>v).map(([k,v])=>`${v}${k}`).join(' ');
+  const meta = `Hand:${p.hand_count} Lib:${p.library_count} GY:${p.graveyard_count} Mulls:${p.mulligans}` +
+               (mana ? ` Mana:${mana}` : '') + (p.city_blessing ? ' ★' : '');
+  let html = `<div class="${active}">
+    <div class="phead"><span class="pname">${p.name}${p.lost?' (LOST)':''}</span>
+      <span class="plife ${low}">♥ ${p.life}</span></div>
+    <div class="pmeta">${meta}</div>`;
+  // BF creatures
+  html += `<div class="zone-label">Creatures</div><div class="row">${creatures.map(c=>renderCard(c,'bf')).join('')}</div>`;
+  if (others.length) html += `<div class="zone-label">Other</div><div class="row">${others.map(c=>renderCard(c,'bf')).join('')}</div>`;
+  html += `<div class="zone-label">Lands</div><div class="row">${lands.map(c=>renderCard(c,'bf')).join('')}</div>`;
+  // hand (only if me)
+  if (isMe) {
+    html += `<div class="zone-label">Hand (${p.hand_count})</div><div class="row">${p.hand.map(c=>renderCard(c,'hand')).join('')}</div>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+function renderControls(w, me, opp) {
+  if (w === 'mulligan') {
+    return `<button onclick='submit({mulligan:false})' class="primary">Keep</button>
+            <button onclick='submit({mulligan:true})' class="danger">Mulligan</button>`;
+  }
+  if (w === 'main') {
+    let html = '';
+    if (selectedCardCid != null) {
+      const card = me.hand.find(c => c.cid === selectedCardCid);
+      if (card) {
+        html += `<div class="target-picker">
+          <h3>Cast: ${card.name}</h3>`;
+        if (card.spectacle_cost) {
+          html += `<label><input type="checkbox" ${useAlt?'checked':''}
+                  onchange='useAlt=this.checked; render()' /> Use alt cost (R)</label> `;
+        }
+        if (card.needs_targets > 0) {
+          html += `<div>Targets selected: ${selectedTargets.length}/${card.needs_targets}</div>`;
+          html += `<button onclick='clickFaceTarget(-2)'>Target opp face</button> `;
+          html += `<button onclick='clickFaceTarget(-1)'>Target own face</button> `;
+        }
+        const canCast = selectedTargets.length >= (card.needs_targets || 0);
+        html += `<button class="primary" ${canCast?'':'disabled'} onclick='castSelected()'>Cast</button> `;
+        html += `<button onclick='selectedCardCid=null; selectedTargets=[]; render()'>Cancel</button>`;
+        html += '</div>';
+      }
+    }
+    html += `<button class="primary" onclick='submit({action:"pass"})'>End Main Phase →</button>`;
+    return html;
+  }
+  if (w === 'declare_attackers') {
+    const candidates = me.battlefield.filter(c => c.is_creature && !c.tap && !c.sick);
+    let html = `<div class="ctrl-row">Toggle attackers:</div><div class="row">`;
+    for (const c of candidates) {
+      const on = toggledAttackers.has(c.cid) ? 'on' : '';
+      const p = c.p_eff != null ? c.p_eff : c.p;
+      const t = c.t_eff != null ? c.t_eff : c.t;
+      html += `<button class="attack-toggle ${on}" onclick="toggleAttacker(${c.cid})">${c.name} ${p}/${t}</button>`;
+    }
+    html += `</div>`;
+    html += `<button class="primary" onclick='submitAttackers()'>Confirm Attackers (${toggledAttackers.size})</button>`;
+    return html;
+  }
+  if (w === 'declare_blockers') {
+    // need attackers list — fetch from opp.battlefield where attacking
+    const oppAtks = opp.battlefield.filter(c => c.attacking);
+    let html = `<div class="ctrl-row">Opp attackers — pick which to block:</div><div class="row">`;
+    for (const a of oppAtks) {
+      const p = a.p_eff != null ? a.p_eff : a.p;
+      const t = a.t_eff != null ? a.t_eff : a.t;
+      const ck = blockingFor === a.cid ? 'on' : '';
+      const blocks = (pendingBlocks[a.cid] || []).length;
+      html += `<button class="attack-toggle ${ck}" onclick="startBlockFor(${a.cid})">${a.name} ${p}/${t} (blockers:${blocks})</button>`;
+    }
+    html += `</div>`;
+    if (blockingFor != null) {
+      const candidates = me.battlefield.filter(c => c.is_creature && !c.tap);
+      html += `<div class="ctrl-row">Assign blocker to attacker ${blockingFor}:</div><div class="row">`;
+      for (const b of candidates) {
+        const used = Object.values(pendingBlocks).some(arr => arr.includes(b.cid));
+        const p = b.p_eff != null ? b.p_eff : b.p;
+        const t = b.t_eff != null ? b.t_eff : b.t;
+        html += `<button ${used?'disabled':''} onclick="assignBlocker(${b.cid})">${b.name} ${p}/${t}</button>`;
+      }
+      html += `</div>`;
+    }
+    html += `<button class="primary" onclick='submitBlocks()'>Confirm Blocks</button>`;
+    return html;
+  }
+  return '<em>Waiting for AI…</em>';
+}
+</script>
+</body>
+</html>

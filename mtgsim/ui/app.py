@@ -18,6 +18,7 @@ from ..engine.observer import Observer
 from ..engine.enums import Subtype
 from ..runner.match import play_match, DeckSpec
 from ..runner.decks import mono_red, mono_white
+from ..ai.heuristic import HeuristicAI
 
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -364,6 +365,242 @@ def flag_slot(slot: int):
         raise HTTPException(404, "slot not found")
     HUB.runs[slot].flag_replay = True
     return {"ok": True, "slot": slot, "flagged": True}
+
+
+# ============================================================
+# Human-vs-AI play mode
+# ============================================================
+PLAY_SESSION = None  # PlaySession singleton (only one game at a time)
+
+
+class PlaySession:
+    def __init__(self, seed: int = None, max_turns: int = 25,
+                 human_side: str = "red"):
+        from ..ai.human import HumanController
+        from ..ai.heuristic import HeuristicAI
+        from ..runner.decks import mono_red, mono_white
+        from ..engine.observer import Observer
+        import random as _r
+        self.seed = seed if seed is not None else int(time.time()) & 0x7FFFFFFF
+        self.rng = _r.Random(self.seed)
+        self.human = HumanController(name="Human", side=human_side)
+        self.ai = HeuristicAI(name="AI:Mono-White", rng=self.rng, archetype="aggro")
+        self.observer = Observer()
+        self.log: deque = deque(maxlen=200)
+        self.game = None
+        self.thread = None
+        self.human_side = human_side
+        self.max_turns = max_turns
+        self.deck0 = mono_red()
+        self.deck1 = mono_white()
+        self.observer.subscribe(self._on_event)
+        self.last_state = {}
+        self._game_done = False
+        self._game_result = None
+
+    def _on_event(self, ev):
+        kind = ev.kind
+        if kind == "log":
+            msg = ev.data.get("msg", "")
+            self.log.append(f"[T{ev.turn} {ev.step}] {msg}")
+        elif kind == "cast":
+            self.log.append(f"[T{ev.turn}] P{ev.data.get('player_idx')} casts {ev.data.get('card')}"
+                            + (" (alt)" if ev.data.get("spec") else ""))
+        elif kind == "game_end":
+            self.log.append(f"=== GAME END: winner={ev.data.get('winner')} turns={ev.data.get('turns')} ===")
+            self._game_done = True
+
+    def start(self):
+        from ..runner.match import setup_game, do_mulligans
+        from ..engine import turn as turn_mod
+
+        # human_side determines who is P0 / P1
+        if self.human_side == "red":
+            p0_deck, p1_deck = self.deck0, self.deck1
+            human_idx = 0
+        else:
+            p0_deck, p1_deck = self.deck1, self.deck0
+            human_idx = 1
+
+        def factory(name, rng_, archetype="midrange"):
+            if name.startswith(f"AI:{p0_deck.name}") and self.human_side == "red":
+                return self.human
+            if name.startswith(f"AI:{p1_deck.name}") and self.human_side == "white":
+                return self.human
+            # AI side
+            if "Red" in name:
+                return HeuristicAI(name=name, rng=rng_, archetype="aggro")
+            return HeuristicAI(name=name, rng=rng_, archetype="aggro")
+
+        def thread_target():
+            from ..ai.heuristic import HeuristicAI  # local
+            self.game, ai0, ai1 = setup_game(
+                p0_deck, p1_deck, self.rng, 0,
+                observer=self.observer, game_id=0, ai_factory=factory,
+            )
+            self.game.max_turns = self.max_turns
+            self.game.log_enabled = True
+
+            def step_fn(g, kind, **kwargs):
+                idx = kwargs.get("player_idx", g.active_idx)
+                ai_used = ai0 if idx == 0 else ai1
+                return ai_used(g, kind, **kwargs)
+            self.game.ai_step = step_fn
+
+            try:
+                do_mulligans(self.game, ai0, ai1)
+                self.observer.emit("game_start", self.game, {
+                    "p0": p0_deck.name, "p1": p1_deck.name, "play_first": 0,
+                })
+                while not self.game.is_over():
+                    turn_mod.take_turn(self.game, step_fn)
+                    if self.game.is_over():
+                        break
+                    turn_mod.advance_turn(self.game)
+                self._game_result = {
+                    "winner": (self.game.players[self.game.winner_idx].name
+                               if self.game.winner_idx is not None else None),
+                    "turns": self.game.turn,
+                    "draw": self.game.draw_game,
+                }
+            except Exception as e:
+                self.log.append(f"!! crash: {e}")
+                self._game_result = {"error": str(e)}
+                self._game_done = True
+
+        from ..ai.heuristic import HeuristicAI
+        self.thread = threading.Thread(target=thread_target, daemon=True)
+        self.thread.start()
+
+    def snapshot(self) -> dict:
+        if self.game is None:
+            return {"ready": False}
+        # determine which step UI needs to render
+        waiting = self.human.waiting_for
+        state = serialize_full_state_play(self.game, self.human_side)
+        return {
+            "ready": True,
+            "seed": self.seed,
+            "human_side": self.human_side,
+            "waiting_for": waiting,
+            "waiting_context": dict(self.human.waiting_context),
+            "state": state,
+            "log": list(self.log)[-40:],
+            "game_done": self._game_done,
+            "result": self._game_result,
+        }
+
+
+def serialize_full_state_play(game, human_side: str) -> dict:
+    """Serialize game state for /play UI. Reveals everything except opp hand."""
+    out = {
+        "turn": game.turn,
+        "active_idx": game.active_idx,
+        "phase": game.phase.name if game.phase else "",
+        "step": game.step.name if game.step else "",
+        "stack_size": len(game.stack),
+        "winner_idx": game.winner_idx,
+        "draw": game.draw_game,
+        "human_idx": 0 if human_side == "red" else 1,
+        "players": [],
+    }
+    human_idx = out["human_idx"]
+    for pi, p in enumerate(game.players):
+        is_human = (pi == human_idx)
+        out["players"].append({
+            "idx": pi,
+            "is_human": is_human,
+            "name": p.name,
+            "life": p.life,
+            "library_count": len(p.library),
+            "graveyard_count": len(p.graveyard),
+            "hand_count": len(p.hand),
+            "hand": [_card_view(c) for c in p.hand] if is_human else [],
+            "battlefield": [_card_view(c, game=game) for c in p.battlefield],
+            "graveyard": [_card_view(c) for c in p.graveyard[-10:]],
+            "exile": [_card_view(c) for c in p.exile[-10:]],
+            "mana": {k: v for k, v in p.mana_pool.pool.items() if v},
+            "city_blessing": p.city_blessing,
+            "mulligans": p.mulligans_taken,
+            "lost": p.lost,
+        })
+    return out
+
+
+def _card_view(c, game=None):
+    d = {
+        "cid": c.cid,
+        "name": c.name,
+        "cmc": c.cdef.cost.cmc() if c.cdef.cost else 0,
+        "cost": (c.cdef.cost.symbols if c.cdef.cost else {}),
+        "is_land": c.cdef.is_land(),
+        "is_creature": c.cdef.is_creature(),
+        "is_instant": c.cdef.is_instant(),
+        "is_sorcery": c.cdef.is_sorcery(),
+        "is_planeswalker": c.cdef.is_planeswalker(),
+        "tap": c.tapped,
+        "sick": c.summoning_sick,
+        "counters": dict(c.counters),
+        "is_token": c.is_token,
+        "attacking": c.attacking,
+        "blocking": list(c.blocking),
+        "spectacle_cost": (c.cdef.spectacle_cost.symbols if c.cdef.spectacle_cost else None),
+        "needs_targets": c.cdef.needs_targets,
+    }
+    if c.cdef.power is not None:
+        d["p"] = c.cdef.power
+        d["t"] = c.cdef.toughness
+        if game is not None and c.cdef.is_creature():
+            d["p_eff"] = c.power(game)
+            d["t_eff"] = c.toughness(game)
+    return d
+
+
+@app.get("/play")
+def play_page():
+    return FileResponse(STATIC_DIR / "play.html")
+
+
+@app.post("/api/play/start")
+def play_start(seed: Optional[int] = None, side: str = "red"):
+    global PLAY_SESSION
+    if PLAY_SESSION is not None and PLAY_SESSION.thread and PLAY_SESSION.thread.is_alive():
+        return {"error": "session already running; refresh page to abandon"}
+    PLAY_SESSION = PlaySession(seed=seed, human_side=side)
+    PLAY_SESSION.start()
+    return {"ok": True, "seed": PLAY_SESSION.seed, "side": side}
+
+
+@app.websocket("/play_ws")
+async def play_ws(ws: WebSocket):
+    await ws.accept()
+    try:
+        async def pusher():
+            while True:
+                if PLAY_SESSION is not None:
+                    try:
+                        snap = PLAY_SESSION.snapshot()
+                        await ws.send_text(json.dumps(snap))
+                    except Exception:
+                        break
+                await asyncio.sleep(0.2)
+
+        push_task = asyncio.create_task(pusher())
+        try:
+            while True:
+                msg = await ws.receive_text()
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+                cmd = data.get("cmd")
+                if cmd == "submit":
+                    if PLAY_SESSION and PLAY_SESSION.human:
+                        PLAY_SESSION.human.submit(data.get("action") or {})
+        finally:
+            push_task.cancel()
+    except WebSocketDisconnect:
+        pass
 
 
 @app.websocket("/ws")
