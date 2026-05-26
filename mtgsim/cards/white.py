@@ -115,7 +115,7 @@ def snubhorn_sentry():
     cdef = CardDef(
         name="Snubhorn Sentry",
         types=CardType.CREATURE,
-        subtypes={Subtype.HUMAN, Subtype.SOLDIER},
+        subtypes={Subtype.SOLDIER},  # actual card: Dinosaur Soldier (skipping DINOSAUR enum — irrelevant)
         cost=ManaCost.parse("W"),
         colors=Color.W,
         power=1, toughness=4,
@@ -352,6 +352,12 @@ def _hob_chap_iii(game, controller, perm):
             c.counters["+2/+1_eot_t"] = c.counters.get("+2/+1_eot_t", 0) + 1
 
 
+def _hob_etb(game, controller, perm):
+    """Dominaria-era saga rule: 'As this Saga enters', add lore counter and fire chapter I."""
+    perm.chapter = 1
+    _hob_chap_i(game, controller, perm)
+
+
 def history_of_benalia():
     cdef = CardDef(
         name="History of Benalia",
@@ -359,8 +365,9 @@ def history_of_benalia():
         subtypes={Subtype.SAGA},
         cost=ManaCost.parse("1WW"),
         colors=Color.W,
-        text="Saga I,II: 2/2 Knight vigilance token. III: Knights +2/+1 UEOT.",
+        text="Saga I,II: 2/2 Knight vigilance token. III: Knights +2/+1 UEOT. (Dominaria timing: chapter I fires on ETB.)",
         chapters=[_hob_chap_i, _hob_chap_ii, _hob_chap_iii],
+        on_etb=_hob_etb,
     )
     return cdef
 
@@ -556,8 +563,8 @@ def adanto_vanguard():
         subtypes={Subtype.VAMPIRE, Subtype.SOLDIER},
         cost=ManaCost.parse("1W"),
         colors=Color.W,
-        power=1, toughness=1,
-        text="Pay 4 life: indestructible UEOT.",
+        power=3, toughness=1,  # FIX: card is 3/1, not 1/1
+        text="Pay 4 life: indestructible UEOT. 3/1.",
     )
     cdef.activated.append(ActivatedAbility(cost_fn=lambda g, p: True, effect=_adanto_van_indestructible,
                                            description="4 life: indestructible UEOT"))

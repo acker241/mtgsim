@@ -342,8 +342,9 @@ class _Helper:
         return False
 
     def convoke_creatures(self, idx: int) -> List[Card]:
+        # convoke ignores summoning sickness (not an activated tap ability)
         return [c for c in self.game.players[idx].battlefield
-                if c.cdef.is_creature() and not c.tapped and not c.summoning_sick]
+                if c.cdef.is_creature() and not c.tapped]
 
     def can_pay_with_convoke(self, pool: Dict[str, int], cost, convoke: List[Card]) -> bool:
         p = dict(pool)

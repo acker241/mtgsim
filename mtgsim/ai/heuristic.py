@@ -99,8 +99,10 @@ class HeuristicAI:
         return sum(p.values()) >= gen
 
     def _convoke_untapped_creatures(self, game: GameState, idx: int) -> List[Card]:
+        # Convoke (109.4): "As you cast this spell, you may tap an untapped creature you control."
+        # Convoke is NOT a tap activated ability — summoning sickness does NOT prevent it.
         return [c for c in game.players[idx].battlefield
-                if c.cdef.is_creature() and not c.tapped and not c.summoning_sick]
+                if c.cdef.is_creature() and not c.tapped]
 
     def _opp(self, game: GameState, idx: int) -> Player:
         return game.players[1 - idx]
@@ -134,7 +136,21 @@ class HeuristicAI:
         idx = game.active_idx
         pl = game.players[idx]
 
-        # 1) play land if haven't yet
+        # Experimental Frenzy in play: "You can't play cards from your hand."
+        # Restricted to top-of-library plays + Light Up exile plays + activated abilities.
+        if pl.ai_data.get("experimental_frenzy"):
+            act = self._try_play_top(game, idx)
+            if act:
+                return act
+            act = self._try_cast_from_exile(game, idx)
+            if act:
+                return act
+            act = self._try_main_activated(game, idx)
+            if act:
+                return act
+            return None
+
+        # 1) play land if haven't yet (lands are played from hand — Frenzy already exited above)
         if pl.lands_played_this_turn < 1:
             lands_in_hand = [c for c in pl.hand if c.cdef.is_land()]
             if lands_in_hand:
@@ -194,6 +210,9 @@ class HeuristicAI:
 
     def _try_cast_sorcery_or_creature(self, game: GameState, idx: int) -> Optional[dict]:
         pl = game.players[idx]
+        # Experimental Frenzy restriction: "You can't play cards from your hand"
+        if pl.ai_data.get("experimental_frenzy"):
+            return None
         pool = self._available_mana(game, idx)
         candidates = []
         in_main1 = (game.step.name == "PRECOMBAT_MAIN")

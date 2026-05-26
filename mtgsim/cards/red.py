@@ -49,14 +49,14 @@ def fanatical_firebrand():
 
 
 # ---------- Ghitu Lavarunner ----------
-# 1/2; has haste as long as 2+ instants/sorceries in your graveyard.
-def _ghitu_haste(game, src, target):
+# 1/2 base. Gets +1/+0 AND has haste if 2+ instants/sorceries in your graveyard.
+def _ghitu_conditional(game, src, target):
     if target.cid != src.cid:
         return (0, 0, set())
     ctrl = game.players[src.controller_idx]
     count = sum(1 for c in ctrl.graveyard if c.cdef.is_instant() or c.cdef.is_sorcery())
     if count >= 2:
-        return (0, 0, {Keyword.HASTE})
+        return (1, 0, {Keyword.HASTE})  # +1/+0 + haste
     return (0, 0, set())
 
 
@@ -67,17 +67,12 @@ def ghitu_lavarunner():
         subtypes={Subtype.HUMAN, Subtype.WIZARD},
         cost=ManaCost.parse("R"),
         colors=Color.R,
-        power=2, toughness=2,
-        text="As long as 2+ instants/sorceries in your graveyard, Ghitu Lavarunner has haste.",
+        power=1, toughness=2,
+        text="1/2. +1/+0 and haste if 2+ instants/sorceries in own graveyard.",
     )
-    # static self-haste
-    cdef.static_mods.append(StaticEffect(apply=_ghitu_haste, description="self-haste conditional"))
+    cdef.static_mods.append(StaticEffect(apply=_ghitu_conditional,
+                                         description="+1/+0 haste conditional"))
     return cdef
-
-
-# Actually Ghitu Lavarunner is 1/2 base, gets +1/+0 if condition? Let me re-check…
-# No: Ghitu Lavarunner is 2/2. "Ghitu Lavarunner can attack as though it had haste" if 2+ instants/sorceries in graveyard.
-# I'll keep haste impl.
 
 
 # ---------- Viashino Pyromancer ----------
