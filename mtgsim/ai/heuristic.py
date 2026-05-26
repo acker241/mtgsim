@@ -1037,45 +1037,93 @@ class HeuristicAI:
     def _declare_blockers(self, game: GameState) -> Dict[int, List[int]]:
         idx = 1 - game.active_idx
         pl = game.players[idx]
-        opp = self._opp(game, idx)
-        # for each attacker, decide block(s)
         blocks: Dict[int, List[int]] = {}
         available = [b for b in pl.battlefield if b.cdef.is_creature() and not b.tapped]
-        # total incoming if all unblocked
         total_incoming = sum(a.power(game) for a in game.attackers)
-        # lethal threat check
         lethal = total_incoming >= pl.life
+
         for atk in sorted(game.attackers, key=lambda a: -a.power(game)):
             akw = atk.keywords(game)
-            # legal blockers
             legal = [b for b in available if b.can_block(atk, game)]
-            # menace requires 2+
             need_min = 2 if Keyword.MENACE in akw else 1
             if len(legal) < need_min:
                 continue
-            # heuristic: block if kills attacker without losing blocker, OR if lethal threat (chump)
-            ap = atk.power(game)
-            at = atk.toughness(game) - atk.damage_marked
+            ap_power = atk.power(game)
+            at_left = atk.toughness(game) - atk.damage_marked
+
             best_block = None
-            # try single block that kills attacker
+            # 1) Single blocker free kill (blocker survives, attacker dies)
             for b in legal:
-                if b.power(game) >= at and ap < b.toughness(game) - b.damage_marked:
+                if (b.power(game) >= at_left
+                        and ap_power < b.toughness(game) - b.damage_marked):
                     best_block = [b]
                     break
-                if b.power(game) >= at and ap == b.toughness(game) - b.damage_marked:
-                    best_block = [b]  # trade
-                    break
+
+            # 2) Single blocker trade (both die — only worth if attacker is real threat)
+            if not best_block:
+                for b in legal:
+                    if (b.power(game) >= at_left
+                            and ap_power >= b.toughness(game) - b.damage_marked):
+                        # trade: worth if attacker.power >= 2 or attacker has FS/anthem
+                        if ap_power >= 2 or atk.name in ("Benalish Marshal", "Goblin Chainwhirler"):
+                            best_block = [b]
+                            break
+
+            # 3) Double block (or N-block): sum power kills attacker
+            if not best_block and len(legal) >= 2 and ap_power >= 2:
+                # try pairs: pick the pair that loses least value
+                best_pair = None
+                best_score = None
+                for i in range(len(legal)):
+                    for j in range(i + 1, len(legal)):
+                        b1, b2 = legal[i], legal[j]
+                        sum_p = b1.power(game) + b2.power(game)
+                        if sum_p < at_left:
+                            continue
+                        # order: small toughness first (gets killed first)
+                        b1_t = b1.toughness(game) - b1.damage_marked
+                        b2_t = b2.toughness(game) - b2.damage_marked
+                        if b1_t > b2_t:
+                            b1, b2 = b2, b1
+                            b1_t, b2_t = b2_t, b1_t
+                        # attacker assigns damage: lethal to b1 first then b2
+                        remaining = ap_power
+                        b1_dies = remaining >= b1_t
+                        if b1_dies:
+                            remaining -= b1_t
+                        b2_dies = remaining >= b2_t
+                        # only commit double-block if value-positive OR lethal threat
+                        # value: attacker_stats - sum(blockers_lost stats)
+                        atk_val = atk.power(game) + atk.toughness(game)
+                        blockers_lost = (b1.power(game) + b1.toughness(game)) * (1 if b1_dies else 0)
+                        blockers_lost += (b2.power(game) + b2.toughness(game)) * (1 if b2_dies else 0)
+                        net = atk_val - blockers_lost
+                        # extra bonus for killing high-priority attackers
+                        if atk.name in ("Benalish Marshal", "Venerated Loxodon",
+                                        "Goblin Chainwhirler", "Rekindling Phoenix"):
+                            net += 4
+                        # only do it if net positive OR forced (lethal)
+                        if net >= 0 or lethal:
+                            score = (-net, b1_dies + b2_dies)  # lower = better
+                            if best_score is None or score < best_score:
+                                best_score = score
+                                best_pair = [b1, b2]
+                if best_pair:
+                    best_block = best_pair
+
+            # 4) Chump if lethal threat
             if not best_block and lethal:
-                # chump with weakest
                 weakest = min(legal, key=lambda b: b.power(game) + b.toughness(game))
                 if Keyword.MENACE in akw:
                     if len(legal) >= 2:
-                        legal.sort(key=lambda b: b.power(game) + b.toughness(game))
-                        best_block = legal[:2]
+                        legal_sorted = sorted(legal, key=lambda b: b.power(game) + b.toughness(game))
+                        best_block = legal_sorted[:2]
                 else:
                     best_block = [weakest]
+
             if best_block:
                 blocks[atk.cid] = [b.cid for b in best_block]
                 for b in best_block:
-                    available.remove(b)
+                    if b in available:
+                        available.remove(b)
         return blocks
